@@ -1,0 +1,34 @@
+stages:
+  - validate
+  - build
+  - publish
+
+validate:
+  stage: validate
+  image: python:3.12
+  before_script:
+    - pip install uv
+    - uv tool install ruff pyright
+  script:
+    - make check
+
+build:
+  stage: build
+  image: python:3.12
+  before_script:
+    - pip install uv
+  script:
+    - uv build
+  artifacts:
+    paths:
+      - dist/
+
+publish:
+  stage: publish
+  image: python:3.12
+  before_script:
+    - pip install uv
+  script:
+    - uv publish
+  only:
+    - tags
