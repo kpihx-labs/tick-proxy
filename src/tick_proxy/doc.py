@@ -67,7 +67,6 @@ def _wrap_output(line: str) -> str:
                     "status": "ok",
                     "comment": "",
                     "edited": False,
-                    "verification": None,
                 },
                 "data": data,
             },

@@ -5,8 +5,16 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 from ..client import TickClient
+from ..exceptions import TickProxyError
 from ..models import Verification
-from .base import ActionDef, always_verify, compare
+from .base import (
+    ActionDef,
+    action_def,
+    compare,
+    require_approval,
+    require_preflight,
+    require_verification,
+)
 
 
 class EmptyPayload(BaseModel):
@@ -113,7 +121,7 @@ class HabitUpdatePayload(BaseModel):
     encouragement: str | None = Field(None, description="New completion message")
 
 
-@always_verify("name")
+@require_verification("name")
 def habit_update(
     client: TickClient, p: HabitUpdatePayload
 ) -> tuple[dict, Verification]:
@@ -173,6 +181,35 @@ class HabitIdPayload(BaseModel):
     habit_id: str = Field(..., description="Habit id")
 
 
+def _require_habit(client: TickClient, habit_id: str) -> None:
+    """Ensure a habit exists before showing its irreversible HITL review.
+
+    Args:
+        client (TickClient): Authenticated client used to list V2 habits.
+        habit_id (str): Identifier of the habit that must exist.
+
+    Returns:
+        None: Returns normally when the requested habit exists.
+
+    Raises:
+        TickProxyError: When the requested habit is already absent.
+
+    Examples:
+        >>> _require_habit(type("C", (), {"v2_get": lambda *_: [{"id": "h1"}]})(), "h1")
+        >>> _require_habit(type("C", (), {"v2_get": lambda *_: []})(), "h1")
+        Traceback (most recent call last):
+        ...
+        tick_proxy.exceptions.TickProxyError: Habit not found: h1.
+    """
+    if not any(habit.get("id") == habit_id for habit in client.v2_get("/habits")):
+        raise TickProxyError(f"Habit not found: {habit_id}.")
+
+
+@require_approval()
+@require_preflight(
+    check=lambda client, payload: _require_habit(client, payload.habit_id),
+    identity_fields=("habit_id",),
+)
 def habit_delete(client: TickClient, p: HabitIdPayload) -> dict:
     """Delete a habit permanently. IRREVERSIBLE — HITL required.
 
@@ -262,13 +299,10 @@ ACTIONS = [
         "habit-update",
         HabitUpdatePayload,
         habit_update,
-        verify="always",
         v2=True,
         group="Habits",
     ),
-    ActionDef(
-        "habit-delete", HabitIdPayload, habit_delete, hitl=True, v2=True, group="Habits"
-    ),
+    action_def("habit-delete", HabitIdPayload, habit_delete, v2=True, group="Habits"),
     ActionDef(
         "habit-checkin", HabitCheckinPayload, habit_checkin, v2=True, group="Habits"
     ),

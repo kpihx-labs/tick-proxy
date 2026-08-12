@@ -1,8 +1,8 @@
 # tick-proxy — Architecture Contract
 
-> **Status:** 🟡 **DESIGN — AWAITING KπX VALIDATION.** No code written yet. This document is the
-> complete refonte plan of `tick-mcp` (MCP server, 71 tools) into `tick-proxy` (non-MCP RPC CLI),
-> built on the exact ADN of `tg-proxy` (`$HOME/KpihX-Labs/tg_proxy`).
+> **Status:** 🟢 **IMPLEMENTED — 52 actions.** This document is the authoritative architecture
+> contract for `tick-proxy`, the non-MCP TickTick CLI built on the ADN of `tg-proxy`
+> (`$HOME/KpihX-Labs/tg_proxy`).
 
 ---
 
@@ -29,9 +29,13 @@ follows **exactly** the `tg-proxy` model (`$HOME/KpihX-Labs/tg_proxy`):
 - **0 Hardcoding · 100% Flexibility** — no hardcoded API URLs in logic, no in-repo `.env`,
   every endpoint/header/timeout overridable from `~/.config/tick-proxy/.env`.
 - **0 Magic · 100% Transparency** — every HTTP call is explicit; V1 vs V2 is stated per action;
-  read-back verification is a structural decorator (`@always_verify`), never a hidden retry loop.
+   read-back verification is a structural decorator (`@require_verification`), never a hidden retry loop.
 - **0 Trust · 100% Control** — secrets live only in `~/.config/tick-proxy/.env` (never in the repo);
-  destructive actions pass through HITL; `raw` gives full escape-hatch access with approval.
+  destructive actions preflight then pass through HITL with their identities locked; `raw` gives full
+  escape-hatch access with approval.
+- **Preflighted destructive review** — deletions and destructive merges read their declared targets
+  before HITL and lock their identity fields. The approval payload cannot redirect the write to a
+  different resource; absent targets fail without opening a review page.
 
 ---
 
@@ -60,7 +64,7 @@ tick-proxy
 **`admin setup` replaces 8 `tick-admin` subcommands.** The old surface
 (`api set|unset`, `session set|unset`, `user set|unset`, `pass set|unset`) collapses into ONE
 HITL web form with **three persisted fields**: `TICK_API_TOKEN`, `TICK_SESSION_TOKEN`,
-`TICK_USERNAME`. Semantics are explicit, not magic:
+`TICK_EMAIL`. Semantics are explicit, not magic:
 
 | Form state | Effect on `.env` |
 |------------|------------------|
@@ -69,7 +73,7 @@ HITL web form with **three persisted fields**: `TICK_API_TOKEN`, `TICK_SESSION_T
 | Field **emptied + `clear` checkbox ticked** | key removed from `.env` |
 
 **Auth & password policy — the TickTick password is NEVER stored.** `.env` holds at most
-`TICK_API_TOKEN` (required), `TICK_SESSION_TOKEN` (optional) and `TICK_USERNAME` (optional — the
+`TICK_API_TOKEN` (required), `TICK_SESSION_TOKEN` (optional) and `TICK_EMAIL` (optional — the
 account e-mail, kept only to pre-fill the refresh form). The password exists **only** inside the
 `admin session-refresh` HITL form, is sent to TickTick for exactly one `POST /user/signon`, and is
 discarded immediately after — never written to disk, never echoed, never autosaved. Credentials
@@ -86,7 +90,7 @@ session token exists, nothing is asked.
    and pre-filled from the current `.env` when present.
 3. On submit, `config.py` writes each filled field to `~/.config/tick-proxy/.env` (`chmod 600`);
    untouched fields keep their existing value; `clear`-checked fields are removed.
-4. Exit 0 with `{"meta":{"status":"ok"},"data":{"config":"~/.config/tick-proxy/.env","fields":["TICK_API_TOKEN","TICK_SESSION_TOKEN","TICK_USERNAME"]}}`.
+4. Exit 0 with `{"meta":{"status":"ok"},"data":{"config":"~/.config/tick-proxy/.env","fields":["TICK_API_TOKEN","TICK_SESSION_TOKEN","TICK_EMAIL"]}}`.
    No password field exists in this form — `setup` never touches credentials.
 
 **`tick-proxy admin status`** (read-only, no HITL, always JSON)
@@ -99,12 +103,15 @@ session token exists, nothing is asked.
 
 **`tick-proxy admin session-refresh`** (HITL — the ONLY place the password is seen)
 1. Triggered when the session token is missing, expired (401) or manually.
-2. HITL form asks for username (pre-filled from `TICK_USERNAME`) and password (`type=password`).
+2. HITL form asks for username (pre-filled from `TICK_EMAIL`) and password (`type=password`).
 3. `POST /api/v2/user/signon?wc=true&remember=true` with `{"username","password"}`.
 4. On success → the `token` is written to `.env` as `TICK_SESSION_TOKEN` (+ timestamps) and the
    password object is **deleted from memory** before any further work.
 5. If the response contains `authId` (device check / 2FA) → a second HITL step collects the
-   verification code, calls `/api/v2/user/sign/mfa/code/verify`, then stores the final token.
+    verification code, calls `/api/v2/user/sign/mfa/code/verify` with `x-verify-id`, then stores
+    the final token. A long-lived challenge requests confirmation that the operator clicked the
+    TickTick email device-approval link before one sign-on retry; neither `authId` nor credentials
+    are persisted or shown in the HITL payload.
 6. Exit 0 with the masked new token. Under no circumstance is the password persisted.
 
 ### `tick-proxy do` — RPC Actions (JSON default, table via `--format/-f`)
@@ -119,18 +126,17 @@ session token exists, nothing is asked.
 | *(positional)* `payload` | Inline JSON `'{"k":"v"}'` **or** a file path `./payload.json` |
 
 > **No `--verify/-V` flag.** Verification is NOT a CLI option — it is a **structural decorator**
-> (`@always_verify`) baked into the handler of the actions that need it. It cannot be forgotten or
+> (`@require_verification`) baked into the handler of the actions that need it. It cannot be forgotten or
 > bypassed: `cli.py` has no way to skip it. See **Verification model**.
 
-**Output envelope — EVERY response (verification lives in `meta`, never in `data`):**
+**Output envelope — EVERY response (verification appears only in `data` when required):**
 
 ```json
 {
   "meta": {
     "status": "ok",
     "comment": "",
-    "edited": false,
-    "verification": null
+    "edited": false
   },
   "data": { }
 }
@@ -141,15 +147,11 @@ session token exists, nothing is asked.
 | `status` | `ok` · `approved` · `rejected` · `error` | `approved`/`rejected` only when HITL was involved |
 | `comment` | free text | the HITL reviewer's comment (empty if none) |
 | `edited` | `true` · `false` | the HITL reviewer modified the payload before approving |
-| `verification` | object · `{}` · `null` | the read-back detail block (see **Verification model**); `null` when the action has no decorator |
+| `verification` | — | never present in `meta` |
 
-> **No `verified` field.** `meta.verification` IS the verdict: a non-empty object ⇒ `verified=true`
-> (the `ok` key inside it is the fine-grained result); `{}` or `null` ⇒ `verified=false`. A separate
-> `verified` boolean would be redundant — the presence of the verification block is the signal.
-
-> **Verification is part of `meta`, NOT `data`** — it describes *how trustworthy the result is*,
-> not the business payload itself. `data` stays pure TickTick content; `meta` carries the
-> audit trail (HITL + verification).
+> **No `verified` boolean and no `meta.verification`.** An action that declares
+> `@require_verification(...)` adds one `data.verification` comparison block; actions without the
+> decorator have no verification field at all.
 
 **Pre-check (ALL `do` commands):** `~/.config/tick-proxy/.env` must exist and expose at least
 `TICK_API_TOKEN` (V1). V2-only actions additionally require V2 auth and fail with an explicit hint
@@ -169,8 +171,8 @@ Naming convention (inherited from `tg-proxy`: `bot-list`, `chat-read`, `folder-s
 
 | Action | Source tool (`tick-mcp`) | Auth | HITL | Notes |
 |--------|--------------------------|:----:|:----:|-------|
-| `task-create` | `create_task` | V1 | ❌ | `{"title":"Buy bread","project_id":"...","priority":3}` |
-| `task-update` | `update_task` | V1 | ❌ | read-modify-write; **always pass `due_date` + `time_zone` with `reminder_minutes`** (anchor gotcha) |
+| `task-create` | `create_task` | V1 | ✅ | mandatory approval; all kinds use full JSON plus three document patches |
+| `task-update` | `update_task` | V1 | ✅ | mandatory approval; all kinds use the same document review; **always pass `due_date` + `time_zone` with `reminder_minutes`** (anchor gotcha) |
 | `task-complete` | `complete_task` | V1 | ❌ | `{"project_id":"...","task_id":"..."}` |
 | `task-reopen` | `reopen_task` | V1 | ❌ | status → 0 |
 | `task-delete` | `delete_task` | V1 | ✅ | irreversible |
@@ -190,8 +192,8 @@ Naming convention (inherited from `tg-proxy`: `bot-list`, `chat-read`, `folder-s
 
 | Action | Source tool | Auth | HITL | Notes |
 |--------|-------------|:----:|:----:|-------|
-| `task-batch-create` | `batch_create_tasks` | V2 | ❌ | `parentId` silently ignored → use `task-parent-set` |
-| `task-batch-update` | `batch_update_tasks` | V2 | ❌ | ⚠️ cannot set reminders — use `task-update` (V1) |
+| `task-batch-create` | `batch_create_tasks` | V2 | ✅ | one full-JSON review; `parentId` silently ignored → use `task-parent-set` |
+| `task-batch-update` | `batch_update_tasks` | V2 | ✅ | one full-JSON review; ⚠️ cannot set reminders reliably — use `task-update` (V1) |
 | `task-batch-delete` | `batch_delete_tasks` | V2 | ✅ | irreversible |
 | `task-move` | `move_tasks` + `verified_move_tasks` + `verified_batch_move` | V2 | ❌ | **always cascades to children** (orphan trap) |
 | `task-parent-set` | `set_subtask_parent` + `verified_set_subtask_parent` | V2 | ❌ | **verification always on** (silent-failure op) |
@@ -217,7 +219,7 @@ Naming convention (inherited from `tg-proxy`: `bot-list`, `chat-read`, `folder-s
 | `project-info` | `get_project_detail` | V1 | ❌ | |
 | `project-create` | `create_project` + `verified_create_project` | V1 (+V2 if `group_id`) | ❌ | `groupId` needs a V2 follow-up (handled internally) |
 | `project-update` | `update_project` + `verified_assign_project_folder` | V1 (+V2 if `group_id`) | ❌ | **verification always on** when `group_id` is set |
-| `project-delete` | `delete_project` | V1 | ✅ | deletes the project **and all its tasks** |
+| `project-delete` | `delete_project` | V1 | ✅ | pre-read → one delete → bounded absence poll (`404` or `{}`); deletes the project **and all its tasks** |
 
 ### Folders (2)
 
@@ -331,7 +333,7 @@ tick-proxy do raw '{"api":"v1","method":"get","endpoint":"/project/6xxx/data"}'
 | Fate | Count | Detail |
 |------|------:|--------|
 | Renamed 1:1 → `do` action | 51 | domain-first kebab rename |
-| Folded into `@always_verify` decorator | 5 | `verified_create_project` → `project-create` · `verified_assign_project_folder` → `project-update` · `verified_set_subtask_parent` → `task-parent-set` · `verified_move_tasks` **and** `verified_batch_move` → `task-move` |
+| Folded into `@require_verification` decorator | 5 | `verified_create_project` → `project-create` · `verified_assign_project_folder` → `project-update` · `verified_set_subtask_parent` → `task-parent-set` · `verified_move_tasks` **and** `verified_batch_move` → `task-move` |
 | **Merged into an existing action** | 7 | `rename_tag` → `tag-update` · `query_notes` **and** `priority_dashboard` **and** `stale_tasks` → `query-tasks` · `get_completed_tasks` **and** `get_deleted_tasks` → `history-query` · `events_of_today` → `view-today` |
 | Folded into `do --help` | 1 | `ticktick_guide` — docstrings are the single source of truth |
 | Folded into `admin status` | 1 | `check_v2_availability` |
@@ -346,61 +348,54 @@ tick-proxy do raw '{"api":"v1","method":"get","endpoint":"/project/6xxx/data"}'
 
 ---
 
-## Verification model — `@always_verify` decorator
+## Verification model — `@require_verification` decorator
 
 The TickTick API fails **silently**: the HTTP call returns 200, the data is not saved.
 `tick-mcp` handled this by shipping 5 duplicated `verified_*` tools. `tick-proxy` centralizes it.
 
 **No `--verify/-V` flag.** Verification is NOT a CLI option — it is a **structural decorator**
-(`@always_verify`) applied directly on the handler of the actions that need it. `cli.py` has no
+(`@require_verification`) applied directly on the handler of the actions that need it. `cli.py` has no
 code path to skip it: if the action is decorated, the read-back ALWAYS runs; if it is not, no flag
 can force it. The decorator is the single source of truth — non-bypassable by construction.
 
 ```python
 # actions/base.py — the decorator (twin of hitl.require_approval)
-def always_verify(*checks: str):
+def require_verification(*checks: str):
     """Mandatory post-write read-back verification, baked into the handler."""
     def decorator(func):
         @wraps(func)
         async def wrapper(client, payload):
             result = await func(client, payload)                    # the write
-            result["meta"] = await verify_write(client, result, checks)  # the re-read + compare
+            result["data"]["verification"] = await verify_write(client, result, checks)
             return result
         return wrapper
     return decorator
 
 # actions/tasks.py — the action definition carries the decorator, no flag anywhere
-@always_verify("parentId", "childIds")
+@require_verification("parentId", "childIds")
 async def task_parent_set(client: TickClient, payload: TaskParentSetPayload) -> dict:
     ...
 ```
 
-**Verification lands in `meta`, NOT `data`** — it describes *how trustworthy the result is*,
-which is audit metadata, not business content. `data` stays pure TickTick payload; `meta` carries
-the whole audit trail (HITL + verification):
+**Verification lands in `data`, never in `meta`** so the returned business object contains the
+persisted state and the exact proof that produced it:
 
 ```json
 {
   "meta": {
     "status": "ok",
     "comment": "",
-    "edited": false,
-    "verification": {
-      "method": "GET /open/v1/project/6xxx/task/68f1...",
-      "checked": ["parentId", "childIds"],
-      "expected": { "parentId": "68e0..." },
-      "actual":   { "parentId": "68e0..." },
-      "ok": true
-    }
+    "edited": false
   },
   "data": {
-    "id": "68f1..."
+    "id": "68f1...",
+    "verification": {"method":"GET /open/v1/project/6xxx/task/68f1...","checked":["parentId","childIds"],"expected":{"parentId":"68e0..."},"actual":{"parentId":"68e0..."},"ok":true}
   }
 }
 ```
 
 **Always-on verification (NOT optional — enforced by the decorator):** the four documented
-silent-failure operations carry `@always_verify`, because a non-verified result is meaningless.
+silent-failure operations carry `@require_verification`, because a non-verified result is meaningless.
 
 | Action | Decorator checks | Why always verified |
 |--------|------------------|---------------------|
@@ -410,11 +405,11 @@ silent-failure operations carry `@always_verify`, because a non-verified result 
 | `task-move` | presence of moved tasks + `childIds` | V2 never cascades to children — orphaned subtasks |
 
 **Anti-bypass guard:** `make smoke` (registry integrity) checks — at import time, via AST — that
-every action declared `verify="always"` in its `ActionDef` actually carries the `@always_verify`
-decorator. A missing decorator is a **hard error**, not a warning. Removing it is impossible
+every action declaring required verification carries the `@require_verification` decorator. A
+missing decorator is a **hard error**, not a warning. Removing it is impossible
 without breaking `make check`.
 
-### `@always_verify` — detailed scenario (always-on case: `task-parent-set`)
+### `@require_verification` — detailed scenario (always-on case: `task-parent-set`)
 
 ```
 1. Intent
@@ -430,9 +425,9 @@ without breaking `make check`.
              expected: {"parentId": "68e0…a"}
              actual:   {"parentId": <what the server REALLY holds>}
 
-5. Report (all in meta)
-   match     → meta.verification.ok=true,   exit 0
-   mismatch  → meta.verification.ok=false,  exit 1
+5. Report (in data)
+   match     → data.verification.ok=true,   exit 0
+   mismatch  → data.verification.ok=false,  exit 1
 ```
 
 The same sequence runs automatically on every decorated action: write → read back → compare →
@@ -453,7 +448,7 @@ independent TickTick integrations:
 | `tick-mcp` live-test suite (`tests/live/`, 12 scripts) | Reminders silently dropped without a `dueDate` anchor; V2 `/habits/batch` = full replacement |
 
 Conclusion: read-back verification is the only reliable way to know whether a TickTick write
-actually landed. The `@always_verify` decorator is not paranoia — it is the documented industry
+actually landed. The `@require_verification` decorator is not paranoia — it is the documented industry
 workaround, made structural.
 
 ---
@@ -485,8 +480,8 @@ TICK_SESSION_TOKEN=
 # [OPTIONAL] TickTick account e-mail — pre-fills the `admin session-refresh` HITL form.
 # The password is NEVER stored: it is requested transiently via HITL only when the
 # session token is invalid, exchanged for a new token, then discarded.
-# Example: TICK_USERNAME=kapoivha@gmail.com
-TICK_USERNAME=
+# Example: TICK_EMAIL=user@example.com
+TICK_EMAIL=
 
 # [AUTO] Timestamps written by `admin setup` / `admin session-refresh` for visibility only.
 # Example: TICK_SESSION_TOKEN_OBTAINED_AT=2026-08-09T11:24:03Z
@@ -649,7 +644,7 @@ async def task_create(client: TickClient, payload: TaskCreatePayload) -> dict:
 
     Examples:
         - Simple task in the Inbox:
-            `tick-proxy do task-create '{"title":"Buy bread"}'`
+            `tick-proxy do task-create '{"title_ops":[{"op":"insert","insert_lines":[0],"insert_text":"Buy bread"}]}'`
             → {"id":"68f1a2b3c4d5e6f708192a3b","title":"Buy bread","projectId":"inbox127..."}
         - High-priority task in a project:
             `tick-proxy do task-create '{"title":"Ship v1","project_id":"6xxx","priority":5}'`
@@ -712,21 +707,32 @@ and in the transient `admin session-refresh` HITL exchange.
 
 Same mechanism as `tg-proxy` (`hitl.py`): a local HTTP server on an OS-assigned free port, the
 browser auto-opens, the payload is editable, the reviewer approves or rejects, and the outcome is
-reported in `meta`. Timeout 300 s → automatic `rejected`. If no browser is available the URL is
+reported in `meta`. Timeout 600 s → automatic `rejected`. If no browser is available the URL is
 printed with an `ssh -L` hint.
 
-**HITL-required — 9 `do` actions + 2 `admin` commands:**
+**HITL-required — 13 `do` actions + 2 `admin` commands:**
 
 | Reason | Actions |
 |--------|---------|
+| Mandatory human review | `task-create` · `task-update` · `subtask-create` — every kind uses one full-JSON task review followed by title/content/desc inline patch frames |
+| Batch write review | `task-batch-create` · `task-batch-update` — one editable complete V2 payload, deliberately without document diff frames |
 | Irreversible deletion | `task-delete` · `task-batch-delete` · `project-delete` · `tag-delete` · `habit-delete` |
 | Destructive side effect | `tag-merge` *(source tag destroyed)* |
-| Conditional deletion | `folder-manage` · `column-manage` *(only when the payload contains `delete`)* |
+| Folder / column mutation | `folder-manage` · `column-manage` — explicit `@require_approval` full-JSON review |
 | Arbitrary API access | `raw` |
 | Secrets | `admin setup` · `admin session-refresh` |
 
-**No HITL** for every create/update/read/view action — an agent planning a week must not open 30
-browser tabs. Deletions and secret writes are the line.
+No new `note-create` / `note-update` actions exist: task kind does not decide review quality. Every
+task create/update carries full normal task JSON plus three explicit operation lists: `title_ops`,
+`content_ops`, and `desc_ops`. An operation is `replace` with `old_str`, mandatory contiguous
+`old_lines`, and `new_str`, or `insert` with `insert_lines` and one `insert_text`. All operations
+are replayed and checked against fresh task text before HITL; stale text/ranges reject the command.
+The unified task page then shows one fully editable complete JSON payload and three vertically
+stacked editable inline Monaco patches. On approval, the complete edited JSON is parsed and sent,
+with the three inline editors taking final precedence only for `title`, `content`, and `desc`. The
+approved response returns exact final `title`, `content`, `desc`, and
+`data.diff.title_diff`, `data.diff.content_diff`, `data.diff.desc_diff`. `meta` remains exactly
+status/comment/edited/verification: there is no `meta.review` block.
 
 ---
 
@@ -743,7 +749,7 @@ browser tabs. Deletions and secret writes are the line.
 | V2 session expired (401) | error envelope + hint `tick-proxy admin session-refresh` — transient HITL credentials (username + password collected, new token saved, password discarded) | 1 |
 | Invalid JSON / file not found | `TickProxyError` envelope | 1 |
 | Pydantic validation error | error envelope listing offending fields | 1 |
-| Verification failed (`@always_verify`) | `meta.verification.ok = false` (block present) | 1 |
+| Verification failed (`@require_verification`) | `data.verification.ok = false` (block present) | 1 |
 | Rate limit (429) | error envelope, no auto-retry (explicit, no magic) | 1 |
 | `admin` + `--format`/`-o` | misuse error envelope | 2 |
 
@@ -762,7 +768,7 @@ All figures below are **exact** line counts measured on `tick-mcp` v0.2.0 — wh
 | `server.py` (137) + `mcp_api/core.py` (357) | 494 | MCP plumbing — no MCP transport any more, the CLI *is* the interface. Includes the `TOOL_CATALOG` (89), `COMMON_WORKFLOWS` (61) and `INTENT_GUIDE` (36) constants that live inside `core.py` |
 | `http_app.py` (FastAPI `/mcp`, `/admin/*`, `/health`) | 235 | existed only to serve the remote MCP container |
 | `admin/telegram.py` (Telegram admin bot) | 218 | remote-operation bridge for the container; a local CLI needs none |
-| `mcp_api/verified.py` — 5 × `verified_*` + `_project_child_index` helper | 214 | replaced by the `@always_verify` decorator. `create_subtask` (71 lines, same file) is **kept** as `subtask-create` |
+| `mcp_api/verified.py` — 5 × `verified_*` + `_project_child_index` helper | 214 | replaced by the `@require_verification` decorator. `create_subtask` (71 lines, same file) is **kept** as `subtask-create` |
 | `ticktick_guide` (in `mcp_api/utilities.py`) | 102 | replaced by docstring-driven `do --help` — single source of truth |
 | `config.yaml` | 57 | folded into documented `config.py` defaults + `.env` overrides |
 | `daemon.py` (PID file, serve/stop/status) | 48 | TickTick is a stateless REST API — no persistent session to own |
@@ -809,9 +815,7 @@ decision (see coverage proof).
 | `.gitlab-ci.yml` | `tg-proxy` | `validate` → `build` → `publish`; **no docker stage** |
 | `.gitignore` | `tg-proxy` | `.env` ignored, `.env.example` kept |
 | `.env.example` | this document | the fully-commented block above |
-| `scripts/install.sh` | `tg-proxy` | `uv tool install . --force` |
-| `scripts/uninstall.sh` | `tg-proxy` | `uv tool uninstall` + config removal (trash-safe `rm`) |
-| `scripts/smoke.sh` | new | end-to-end CLI smoke against an isolated config dir |
+| *(none)* | — | Install, uninstall and smoke are concise Makefile targets; duplicate shell wrappers are intentionally absent |
 | `tests/` | `tick-mcp` | port the unit tests (models, query engine, config, admin service) |
 | `tests/live/` | `tick-mcp` | the 12 numbered live scripts, re-pointed at the CLI |
 | `README.md` · `AGENTS.md` · `CHANGELOG.md` · `TODO.md` | standard | |
@@ -837,14 +841,14 @@ decision (see coverage proof).
 | # | Decision | Proposal | Impact if refused |
 |---|----------|----------|-------------------|
 | **D1** | Action naming | flip to **domain-first kebab** (`task-create`, not `create-task`) — matches `tg-proxy` (`bot-list`, `chat-read`) | keep `create-task` style; `tg-proxy` ADN broken |
-| **D2** | 5 × `verified_*` tools | fold into the **`@always_verify` decorator** on the 4 silent-failure ops | keep 5 duplicate actions → 70 actions |
+| **D2** | 5 × `verified_*` tools | fold into the **`@require_verification` decorator** on the silent-failure ops | keep 5 duplicate actions → 70 actions |
 | **D3** | `ticktick_guide` | drop — `do --help` / `do <action> --help` generated from docstrings is the guide | keep a `guide` action duplicating docstrings |
 | **D4** | `check_v2_availability` | fold into `admin status` | keep as a 66th action |
 | **D5** | 8 × `tick-admin` credential commands | fold into ONE `admin setup` HITL form (3 persisted fields + clear checkboxes; **password never stored** — transient HITL only, see *Auth & password policy*) | keep 8 flat `admin` actions |
 | **D6** | `config.yaml` | drop — documented defaults in `config.py`, all overridable via `.env` | keep a second config file |
 | **D7** | Env prefix | **`TICK_*`** (harmonizes with `TG_*`) | any other prefix |
 | **D8** | HTTP transport + Telegram admin bot + daemon | **drop** (they served the Docker deployment only) | must keep FastAPI + bot + PID lifecycle |
-| **D9** | HITL scope | deletions + `tag-merge` + `raw` + admin secrets **only** | wider (every write) or narrower (none) |
+| **D9** | HITL scope | deletions + `tag-merge` + `raw` + admin secrets, plus **mandatory `task-create` / `task-update`**; NOTE uses locked document-diff mode | narrower policy would violate the approved task-write review requirement |
 | **D10** | Actions layout | `actions/` registry with colocated Pydantic payloads | monolithic `client.py` (~5000 lines) |
 | **D11** | Old repo | keep `~/Work/AI/MCPs/tick_mcp/` as reference until parity, then archive | delete immediately |
 
@@ -859,7 +863,7 @@ decision (see coverage proof).
 | **P2** | `hitl.py` + `templates/` + `admin.py` (setup, status, session-refresh) | full auth lifecycle proven live |
 | **P3** | `actions/base.py` + `registry.py` + `cli.py` wired to the registry; first 5 task actions | `do --help` + `do task-create` live |
 | **P4** | Port all remaining actions domain by domain (`api/` + `query.py` ported alongside) | registry = 52, `make smoke` green |
-| **P5** | Verification engine (`@always_verify` on the 4 silent-failure ops) | verified writes proven live |
+| **P5** | Verification engine (`@require_verification` on declared writes) | verified writes proven live |
 | **P6** | `raw` gateway | live V1 + V2 raw calls proven |
 | **P7** | Tests: port unit tests, adapt `tests/live/` (12 scripts) to the CLI | `make check` fully green |
 | **P8** | Docs: `README.md`, `CHANGELOG.md` 1.0.0; ecosystem switch (`opencode.jsonc`, `k-ticktick` skill) | agents use `tick-proxy` end-to-end |

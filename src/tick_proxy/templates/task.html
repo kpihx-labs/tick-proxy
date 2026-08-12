@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Tick-Proxy — Task review</title><link rel="stylesheet" href="/assets/hitl.css"></head>
+<body>
+<div id="complete-overlay"><div><h1 id="complete-title">Task submitted</h1><p id="complete-message">The exact edited values were sent.</p></div></div>
+<header class="hitl-header"><div><h1 class="hitl-brand">Tick-Proxy · Task review</h1><p class="hitl-subtitle">Full action JSON remains visible; title, content, and description are reviewed below as inline patches.</p><p id="status" class="hitl-status">Loading inline diff editors…</p></div><div class="hitl-actions"><button id="reject" class="hitl-button hitl-reject" type="button" onclick="submit('rejected')">Reject</button><button id="approve" class="hitl-button hitl-approve" type="button" disabled onclick="submit('approved')">Approve & send</button></div></header>
+<main class="hitl-container">
+  <section class="hitl-card"><h2>Full action JSON <span class="field-label">editable · this complete object is submitted</span></h2><div class="hitl-card-body"><textarea id="payload" class="hitl-input hitl-json"></textarea></div></section>
+  <section class="task-diffs">
+    <article class="hitl-card task-diff"><h2>Title <span class="field-label">inline patch · editable result</span></h2><div id="title-editor" class="editor"></div></article>
+    <article class="hitl-card task-diff"><h2>Content <span class="field-label">inline patch · editable result</span></h2><div id="content-editor" class="editor"></div></article>
+    <article class="hitl-card task-diff"><h2>Description <span class="field-label">inline patch · editable result</span></h2><div id="desc-editor" class="editor"></div></article>
+  </section>
+</main>
+<footer class="hitl-footer"><textarea id="comment" class="hitl-input" placeholder="Comment (optional)"></textarea></footer>
+<script id="task-data" type="application/json">{{TASK_CONTEXT_JSON}}</script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/monaco-editor/0.44.0/min/vs/loader.min.js"></script>
+<script>
+const context = JSON.parse(document.getElementById('task-data').textContent);
+const fields = ['title', 'content', 'desc'];
+const editors = {};
+const initialPayload = JSON.stringify(context.payload, null, 2);
+document.getElementById('payload').value = initialPayload;
+function blocked(message) { document.getElementById('status').textContent = message; }
+function ready() { document.getElementById('approve').disabled = false; blocked('Ready · edit any right-hand result inline, then approve.'); }
+if (typeof require === 'undefined') { blocked('Inline diff editor unavailable: review is blocked.'); }
+else {
+  require.config({ paths: { vs: 'https://cdnjs.cloudflare.com/ajax/libs/monaco-editor/0.44.0/min/vs' }});
+  require(['vs/editor/editor.main'], function() {
+    for (const field of fields) {
+      const editor = monaco.editor.createDiffEditor(document.getElementById(field + '-editor'), { automaticLayout: true, originalEditable: false, readOnly: false, renderSideBySide: false, theme: 'vs-dark', wordWrap: 'on', fontSize: 13 });
+      editor.setModel({ original: monaco.editor.createModel(context.original[field], 'markdown'), modified: monaco.editor.createModel(context.proposed[field], 'markdown') });
+      editors[field] = editor;
+    }
+    ready();
+  }, () => blocked('Inline diff editor unavailable: review is blocked.'));
+}
+async function submit(status) {
+  if (status === 'approved' && Object.keys(editors).length !== fields.length) { blocked('Inline diff editor is not ready.'); return; }
+  document.getElementById('approve').disabled = true; document.getElementById('reject').disabled = true; blocked('Submitting the exact inline-edited values…');
+  let payload;
+  try {
+    payload = JSON.parse(document.getElementById('payload').value);
+  } catch (error) {
+    blocked('Full action JSON is invalid: ' + error.message);
+    document.getElementById('approve').disabled = false; document.getElementById('reject').disabled = false;
+    return;
+  }
+  for (const field of fields) payload[field] = status === 'approved' ? editors[field].getModifiedEditor().getValue() : context.proposed[field];
+  const edited = JSON.stringify(payload) !== JSON.stringify(context.payload) || fields.some(field => payload[field] !== context.proposed[field]);
+  try {
+    const response = await fetch('/submit', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id: context.id, status, payload, comment: document.getElementById('comment').value, edited }) });
+    if (!response.ok) throw new Error('Local review server rejected submission (' + response.status + ').');
+    document.getElementById('complete-overlay').style.display = 'flex';
+    if (status === 'rejected') { document.getElementById('complete-title').textContent = 'Review rejected'; document.getElementById('complete-message').textContent = 'No TickTick write was made.'; }
+  } catch (error) { blocked('Submission failed: ' + error.message); document.getElementById('approve').disabled = false; document.getElementById('reject').disabled = false; }
+}
+</script></body></html>

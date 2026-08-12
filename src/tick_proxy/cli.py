@@ -7,19 +7,20 @@ Usage:
 
 All output in JSON (default) or table format.
 Admin is ALWAYS JSON. 'do' defaults to JSON, can switch to table.
-Verification is structural (@always_verify on the handler) — there is no flag.
+Verification is structural (`@require_verification` on the handler) — there is no flag.
 """
 
 import json
 import sys
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 
 import typer
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
 from . import __version__, admin
-from .actions.base import ActionDef
+from .actions.base import ActionDef, compare
 from .actions.registry import REGISTRY, by_group
 from .client import TickClient
 from .config import ensure_env
@@ -28,7 +29,13 @@ from .doc import get_compact_help, get_full_help
 from .exceptions import TickProxyError
 from .hitl import request_approval
 from .logger import setup_logging
-from .models import Verification, ok, rejected
+from .models import Status, Verification, ok, rejected
+from .task_documents import (
+    DOCUMENT_FIELDS,
+    DocumentOperations,
+    field_diffs,
+    prepare_document_review,
+)
 
 AUTOSAVE_DIR = Path("/tmp/tick-proxy-autosave")
 
@@ -104,6 +111,27 @@ def output_result(result: dict, fmt: str = "json") -> None:
         print_json(data=result)
 
 
+def output_rejection(comment: str, edited: bool, fmt: str = "json") -> None:
+    """Print the canonical HITL rejection envelope and terminate with code one.
+
+    Args:
+        comment (str): Reviewer reason or timeout explanation.
+        edited (bool): Whether the reviewer changed the reviewed payload.
+        fmt (str): Requested output format; rejected output remains an envelope.
+
+    Returns:
+        None: Always raises `typer.Exit(1)` after printing.
+
+    Examples:
+        >>> output_rejection("not now", False)  # doctest: +SKIP
+        {"meta":{"status":"rejected",...},"data":null}
+        >>> output_rejection("timeout", False, "table")  # doctest: +SKIP
+        {"meta":{"status":"rejected",...},"data":null}
+    """
+    output_result(rejected(comment, edited), fmt)
+    raise typer.Exit(1)
+
+
 def _autosave(action: str, result: dict) -> Path:
     """Write the envelope to /tmp/tick-proxy-autosave and return the path.
 
@@ -146,53 +174,186 @@ def _execute(
         >>> _execute(REGISTRY["task-delete"], '{"task_id":"x","project_id":"y"}', None, "json")
         (opens the HITL form, then prints the envelope)
     """
-    ensure_env(require_v2=action.v2)
+    try:
+        ensure_env(require_v2=action.v2)
+    except TickProxyError as exc:
+        print_error(str(exc))
+        sys.exit(1)
     params = parse_payload(payload_raw)
 
     meta_status, comment, edited = "ok", "", False
-    if action.hitl:
-        response = request_approval(action.name, params)
-        if response.status == "rejected":
-            output_result(rejected(response.comment, response.edited), fmt)
+    required_checks = tuple(getattr(action.handler, "__verification_checks__", ()))
+    task_context: dict[str, dict] | None = None
+    client: TickClient | None = None
+    preflight_payload: BaseModel | None = None
+    preflight = getattr(action.handler, "__preflight_check__", None)
+    preflight_identity_fields = tuple(
+        getattr(action.handler, "__preflight_identity_fields__", ())
+    )
+    if preflight is not None:
+        try:
+            preflight_payload = action.payload(**params) if action.payload else None
+        except ValidationError as exc:
+            print_error(f"Validation error: {exc}")
             sys.exit(1)
+        client = TickClient()
+        try:
+            preflight(client, preflight_payload)
+        except TickProxyError as exc:
+            client.close()
+            print_error(str(exc))
+            sys.exit(1)
+    if action.hitl:
+        if action.review_mode == "task":
+            direct_document_fields = sorted(
+                field for field in DOCUMENT_FIELDS if field in params
+            )
+            if direct_document_fields:
+                print_error(
+                    "Task document fields must be expressed through operations, not raw "
+                    "values: "
+                    f"{', '.join(f'{field}_ops' for field in direct_document_fields)} required."
+                )
+                sys.exit(1)
+        prevalidated = None
+        if action.payload:
+            try:
+                prevalidated = action.payload(**params)
+            except ValidationError:
+                prevalidated = None
+        if action.review_mode == "task" and prevalidated is not None:
+            original_task: dict = {}
+            if action.name == "task-update":
+                client = TickClient()
+                try:
+                    original_task = client.v1_get(
+                        f"/project/{prevalidated.project_id}/task/{prevalidated.task_id}"
+                    )
+                except TickProxyError as exc:
+                    client.close()
+                    print_error(str(exc))
+                    sys.exit(1)
+            try:
+                document = prepare_document_review(
+                    original_task,
+                    DocumentOperations.model_validate(prevalidated.model_dump()),
+                    require_title=action.name in {"task-create", "subtask-create"},
+                )
+                materialized = {**prevalidated.model_dump(), **document["proposed"]}
+            except ValueError as exc:
+                if client is not None:
+                    client.close()
+                print_error(str(exc))
+                sys.exit(1)
+            task_context = {
+                "original": document["original"],
+                "proposed": {
+                    field: str(materialized[field] or "") for field in DOCUMENT_FIELDS
+                },
+                "payload": params,
+            }
+            response = request_approval(action.name, params, task_context=task_context)
+        else:
+            response = request_approval(action.name, params)
+        if response.status == "rejected":
+            if client is not None:
+                client.close()
+            output_rejection(response.comment, response.edited, fmt)
         if isinstance(response.payload, dict):
-            params = response.payload
+            if task_context is not None:
+                params = {
+                    **params,
+                    **response.payload,
+                    **task_context["proposed"],
+                    **{field: response.payload[field] for field in DOCUMENT_FIELDS},
+                }
+            else:
+                params = response.payload
+        if preflight_payload is not None and any(
+            params.get(field) != preflight_payload.model_dump().get(field)
+            for field in preflight_identity_fields
+        ):
+            if client is not None:
+                client.close()
+            print_error(
+                "Reviewed payload changed the preflighted target identity: "
+                f"{', '.join(preflight_identity_fields)}."
+            )
+            sys.exit(1)
         meta_status, comment, edited = "approved", response.comment, response.edited
 
     try:
         validated = action.payload(**params) if action.payload else None
     except ValidationError as exc:
+        if client is not None:
+            client.close()
         print_error(f"Validation error: {exc}")
         sys.exit(1)
 
-    client = TickClient()
+    if client is None:
+        client = TickClient()
     try:
         outcome = action.handler(client, validated)
+        verification: Verification | None = None
+        if isinstance(outcome, tuple):
+            data, verification = outcome
+        else:
+            data = outcome
+        if task_context is not None and isinstance(data, dict):
+            task_id = str(data.get("id") or params.get("task_id") or "")
+            project_id = str(data.get("projectId") or params.get("project_id") or "")
+            persisted = client.v1_get(f"/project/{project_id}/task/{task_id}")
+            final_document = {
+                field: str(persisted.get(field) or "") for field in DOCUMENT_FIELDS
+            }
+            expected_document: dict[str, str | None] = {
+                field: str(params.get(field) or "") for field in DOCUMENT_FIELDS
+            }
+            final_values: dict[str, str | None] = dict(final_document)
+            if "parentId" in required_checks:
+                expected_document["parentId"] = params.get("parent_id")
+                final_values["parentId"] = persisted.get("parentId")
+            verification = compare(
+                f"GET /open/v1/project/{project_id}/task/{task_id}",
+                expected_document,
+                final_values,
+            )
+            data = {
+                **data,
+                **final_document,
+                "diff": field_diffs(
+                    task_context["original"],
+                    final_document,
+                ),
+            }
+        if required_checks and verification is None:
+            raise TickProxyError(
+                f"{action.name} declares @require_verification but returned no proof."
+            )
+        if verification is not None and set(verification.checked) != set(
+            required_checks
+        ):
+            raise TickProxyError(
+                f"{action.name} verification checks do not match its declared policy."
+            )
     except TickProxyError as exc:
         print_error(str(exc))
         sys.exit(1)
     finally:
         client.close()
 
-    verification: Verification | None = None
-    if isinstance(outcome, tuple):
-        data, verification = outcome
-    else:
-        data = outcome
-
-    result = ok(data, verification)
-    result["meta"]["status"] = meta_status
-    result["meta"]["comment"] = comment
-    result["meta"]["edited"] = edited
+    if verification is not None and isinstance(data, dict):
+        data = {**data, "verification": verification.model_dump()}
+    result = ok(data, edited=edited, comment=comment, status=meta_status)
 
     autosave_path = _autosave(action.name, result)
     if output_file:
         out = Path(output_file)
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(json.dumps(result, indent=2, default=str))
-        console.print(f"[dim]📄 Written to: {out}[/dim]")
+        print(f"📄 Written to: {out}", file=sys.stderr)
     else:
-        console.print(f"[dim]💾 Autosave: {autosave_path}[/dim]")
+        print(f"💾 Autosave: {autosave_path}", file=sys.stderr)
 
     output_result(result, fmt)
     if verification is not None and not verification.ok:
@@ -275,14 +436,36 @@ def main(
 # ─── Admin ───
 
 
+def _run_admin(command: Callable[[], tuple[dict | None, Status, bool, str]]) -> None:
+    """Run one admin manager without applying the `do` configuration gate.
+
+    Args:
+        command (Callable[[], tuple[dict | None, Status, bool, str]]): Zero-argument
+            admin callable returning normalized HITL metadata.
+
+    Returns:
+        None: Prints an approved envelope or the shared rejection envelope.
+
+    Examples:
+        >>> _run_admin(lambda: ({"status": "ok"}, "approved", False, ""))  # doctest: +SKIP
+        {"meta":{"status":"approved",...},"data":{"status":"ok"}}
+        >>> _run_admin(lambda: (None, "rejected", False, "not now"))  # doctest: +SKIP
+        {"meta":{"status":"rejected",...},"data":null}
+    """
+    try:
+        data, status, edited, comment = command()
+    except TickProxyError as exc:
+        print_error(str(exc))
+        raise typer.Exit(1) from exc
+    if status == "rejected":
+        output_rejection(comment, edited)
+    print_json(data=ok(data, status=status, edited=edited, comment=comment))
+
+
 @app_admin.command("setup")
 def admin_setup() -> None:
     """Configure credentials via the HITL web form (ALWAYS JSON)."""
-    try:
-        print_json(data=ok(admin.setup()))
-    except TickProxyError as exc:
-        print_error(str(exc))
-        sys.exit(1)
+    _run_admin(admin.setup)
 
 
 @app_admin.command("status")
@@ -291,14 +474,22 @@ def admin_status() -> None:
     print_json(data=ok(admin.status()))
 
 
+@app_admin.command("reset")
+def admin_reset() -> None:
+    """Empty the configuration file (ALWAYS JSON)."""
+    _run_admin(admin.reset)
+
+
+@app_admin.command("purge")
+def admin_purge() -> None:
+    """Delete the configuration directory and uninstall the CLI (ALWAYS JSON)."""
+    _run_admin(admin.purge)
+
+
 @app_admin.command("session-refresh")
 def admin_session_refresh() -> None:
     """Get a fresh V2 session token — password collected transiently (ALWAYS JSON)."""
-    try:
-        print_json(data=ok(admin.session_refresh()))
-    except TickProxyError as exc:
-        print_error(str(exc))
-        sys.exit(1)
+    _run_admin(admin.session_refresh)
 
 
 # ─── do ───

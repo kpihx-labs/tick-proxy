@@ -49,7 +49,7 @@ def user_status(client: TickClient, p: EmptyPayload) -> dict:
     Examples:
         - Who am I?
             `tick-proxy do user-status`
-            → {"userId":"5f8a1c2e4b7d4e9f8a1b2c3d","username":"kapoivha@gmail.com","inboxId":"inbox1275839472","pro":true}
+            → {"userId":"5f8a1c2e4b7d4e9f8a1b2c3d","username":"user@example.com","inboxId":"inbox1275839472","pro":true}
         - Check Pro expiry:
             `tick-proxy do user-status`
             → {"pro":true,"proEndDate":"2027-01-15T00:00:00.000+0000"}

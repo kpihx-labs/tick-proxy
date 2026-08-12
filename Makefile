@@ -13,9 +13,9 @@ UV     := $(shell command -v uv 2>/dev/null || echo uv)
 PYTHON := $(UV) run python
 PYTEST := $(PYTHON) -m pytest
 
-PY_FILES := $(shell find $(PKG_DIR) -name "*.py")
+PY_FILES := $(shell $(UV) run python -c 'from pathlib import Path; print(" ".join(map(str, Path("$(PKG_DIR)").rglob("*.py"))))')
 
-.PHONY: help check smoke uv-install uv-link uv-uninstall uv-purge uv-build uv-publish git-push push release git-install-hooks
+.PHONY: help check smoke uv-install uv-link uv-uninstall uv-build uv-publish git-push push release git-install-hooks
 
 help: ## Show help
 	@grep -E '^[a-zA-Z_-]+:.*##' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*##"}; {printf "\033[36m%-20s\033[0m %s\n", $$1, $$2}'
@@ -48,16 +48,11 @@ uv-uninstall: ## Uninstall uv tool
 	@$(UV) tool uninstall $(PKG_NAME) 2>/dev/null || true
 	@echo "✅ $(PKG_NAME) uninstalled"
 
-uv-purge: uv-uninstall ## Full purge
-	@rm -rf dist/ build/ *.egg-info
-	@echo "✅ $(PKG_NAME) purged"
-
 # ─── Build / Publish ───
 
 uv-build: ## Build Python sdist and wheel
 	@echo "🏗️  Building Python package v$(VERSION)..."
-	@rm -rf dist/
-	@$(UV) build
+	@$(UV) build --clear
 
 uv-publish: uv-build ## Publish to PyPI
 	@echo "🚀 Publishing v$(VERSION) to PyPI..."

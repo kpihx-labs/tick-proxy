@@ -14,10 +14,7 @@ Status = Literal["ok", "approved", "rejected", "error"]
 
 
 class Verification(BaseModel):
-    """Read-back verification block, produced by the `@always_verify` decorator.
-
-    Lives in `meta.verification`, never in `data`: it describes *how trustworthy
-    the result is*, which is audit metadata, not business content.
+    """Read-back verification block returned inside `data.verification`.
 
     Attributes:
         method (str): The read-back performed, e.g. ``GET /open/v1/project/6xxx/task/68f1``.
@@ -45,20 +42,14 @@ class Verification(BaseModel):
 class OutputMeta(BaseModel):
     """The `meta` half of every response envelope.
 
-    There is deliberately **no `verified` boolean**: a non-empty `verification`
-    object means verified, `None`/empty means not verified.
-
     Attributes:
         status (Status): ok · approved · rejected · error. `approved`/`rejected`
             only appear when HITL was involved.
         comment (str): The HITL reviewer's comment (empty when none).
         edited (bool): True when the HITL reviewer modified the payload.
-        verification (Verification | None): Read-back detail, or None when the
-            action carries no `@always_verify` decorator.
-
     Examples:
         >>> OutputMeta().model_dump()
-        {'status': 'ok', 'comment': '', 'edited': False, 'verification': None}
+        {'status': 'ok', 'comment': '', 'edited': False}
         >>> OutputMeta(status="rejected", comment="too risky").status
         'rejected'
     """
@@ -66,16 +57,13 @@ class OutputMeta(BaseModel):
     status: Status = Field(default="ok", description="Result status")
     comment: str = Field(default="", description="HITL reviewer comment")
     edited: bool = Field(default=False, description="HITL reviewer edited the payload")
-    verification: Verification | None = Field(
-        default=None, description="Read-back verification (meta, never data)"
-    )
 
 
 class Output(BaseModel):
     """The full response envelope printed on stdout.
 
     Attributes:
-        meta (OutputMeta): Audit metadata (status, HITL, verification).
+        meta (OutputMeta): Command metadata (status, HITL).
         data (Any): The pure TickTick payload — never mixed with metadata.
 
     Examples:
@@ -89,12 +77,19 @@ class Output(BaseModel):
     data: Any = Field(default=None)
 
 
-def ok(data: Any, verification: Verification | None = None) -> dict:
+def ok(
+    data: Any,
+    edited: bool = False,
+    comment: str = "",
+    status: Status = "ok",
+) -> dict:
     """Build a successful envelope as a plain dict.
 
     Args:
         data (Any): The business payload to return.
-        verification (Verification | None): Optional read-back proof.
+        edited (bool): Whether the payload was edited during HITL review.
+        comment (str): The HITL reviewer's comment (empty when none).
+        status (Status): Result status (ok, approved, rejected, error).
 
     Returns:
         dict: ``{"meta": {...}, "data": ...}`` ready to print.
@@ -106,7 +101,7 @@ def ok(data: Any, verification: Verification | None = None) -> dict:
         []
     """
     return Output(
-        meta=OutputMeta(verification=verification),
+        meta=OutputMeta(status=status, comment=comment, edited=edited),
         data=data,
     ).model_dump()
 

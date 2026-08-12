@@ -6,7 +6,16 @@ from pydantic import BaseModel, Field
 
 from ..client import TickClient
 from ..models import Verification
-from .base import ActionDef, always_verify, compare
+from ..task_documents import materialize_document_fields
+from .base import (
+    ActionDef,
+    action_def,
+    compare,
+    require_approval,
+    require_preflight,
+    require_reviews,
+    require_verification,
+)
 from .tasks import TaskCreatePayload, task_create
 
 
@@ -14,8 +23,9 @@ class BatchCreatePayload(BaseModel):
     tasks: list[dict] = Field(..., description="Task dicts; each needs at least title")
 
 
+@require_approval()
 def task_batch_create(client: TickClient, p: BatchCreatePayload) -> dict:
-    """Create several tasks in one V2 batch call.
+    """Create several tasks in one V2 batch call after one full-JSON HITL review.
 
     ⚠️ `parentId` is silently ignored here — link children afterwards with
     `task-parent-set` (which verifies the link).
@@ -39,8 +49,9 @@ class BatchUpdatePayload(BaseModel):
     tasks: list[dict] = Field(..., description="Task dicts; each needs id + projectId")
 
 
+@require_approval()
 def task_batch_update(client: TickClient, p: BatchUpdatePayload) -> dict:
-    """Update several tasks in one V2 batch call.
+    """Update several tasks in one V2 batch call after one full-JSON HITL review.
 
     ⚠️ This endpoint cannot set reminders reliably — use `task-update` (V1) with
     an explicit `due_date` anchor for anything reminder-related.
@@ -64,6 +75,31 @@ class BatchDeletePayload(BaseModel):
     tasks: list[dict] = Field(..., description="[{taskId, projectId}, …]")
 
 
+def _require_tasks(client: TickClient, tasks: list[dict]) -> None:
+    """Ensure every batch deletion target exists before its shared HITL review.
+
+    Args:
+        client (TickClient): Authenticated V1 client used for task reads.
+        tasks (list[dict]): Deletion records containing `projectId` and `taskId`.
+
+    Returns:
+        None: Returns normally only after every target read succeeds.
+
+    Examples:
+        >>> _require_tasks(type("C", (), {"v1_get": lambda *_: {"id": "t1"}})(), [{"projectId": "p1", "taskId": "t1"}])
+        >>> _require_tasks(type("C", (), {"v1_get": lambda *_: {"id": "t1"}})(), [])
+        >>> bool("taskId")
+        True
+    """
+    for task in tasks:
+        client.v1_get(f"/project/{task['projectId']}/task/{task['taskId']}")
+
+
+@require_approval()
+@require_preflight(
+    check=lambda client, payload: _require_tasks(client, payload.tasks),
+    identity_fields=("tasks",),
+)
 def task_batch_delete(client: TickClient, p: BatchDeletePayload) -> dict:
     """Delete several tasks in one V2 batch call. IRREVERSIBLE — HITL required.
 
@@ -87,15 +123,15 @@ class MovePayload(BaseModel):
     )
 
 
-@always_verify("projectId")
+@require_verification("projectId")
 def task_move(client: TickClient, p: MovePayload) -> tuple[dict, Verification]:
     """Move tasks between projects — children are moved too, then verified.
 
     The V2 API never cascades to subtasks: moving a parent alone leaves its
     children stranded in the old project. This action fetches `childIds` from
     each source project and appends the children to the same batch. The result
-    is ALWAYS read back and compared (`@always_verify`) — a silent partial move
-    turns into `meta.verification.ok=false` and exit code 1.
+    is ALWAYS read back and compared (`@require_verification`) — a silent partial
+    move turns into `data.verification.ok=false` and exit code 1.
 
     Parameters:
         - moves (list[dict]): `[{"taskId","fromProjectId","toProjectId"}, …]`.
@@ -154,7 +190,7 @@ class ParentSetPayload(BaseModel):
     old_parent_id: str | None = Field(None, description="Previous parent id (unset)")
 
 
-@always_verify("parentId")
+@require_verification("parentId")
 def task_parent_set(
     client: TickClient, p: ParentSetPayload
 ) -> tuple[dict, Verification]:
@@ -199,7 +235,9 @@ class SubtaskCreatePayload(TaskCreatePayload):
     project_id: str = Field(..., description="Project holding the parent")  # type: ignore[assignment]
 
 
-@always_verify("parentId")
+@require_reviews
+@require_approval("task")
+@require_verification("title", "content", "desc", "parentId")
 def subtask_create(
     client: TickClient, p: SubtaskCreatePayload
 ) -> tuple[dict, Verification]:
@@ -210,20 +248,25 @@ def subtask_create(
     and compared before the command returns.
 
     Parameters:
-        - title (str): Subtask title. parent_id (str), project_id (str): required.
+        - title_ops/content_ops/desc_ops: Same checked document operations as
+          `task-create`; raw title/content/desc values are rejected.
+        - parent_id (str), project_id (str): required.
         - All other `task-create` fields are accepted (priority, due_date, tags…).
 
     Examples:
-        - Add a subtask under a parent:
-            `tick-proxy do subtask-create '{"title":"Draft outline","parent_id":"68e0","project_id":"6xxx"}'`
+        - Add a subtask under a parent with a title insertion:
+            `tick-proxy do subtask-create '{"title_ops":[{"op":"insert","insert_lines":[0],"insert_text":"Draft outline"}],"parent_id":"68e0","project_id":"6xxx"}'`
             → {"id":"68f1","title":"Draft outline","parentId":"68e0"}
-        - Add a high-priority subtask with a due date:
-            `tick-proxy do subtask-create '{"title":"Review","parent_id":"68e0","project_id":"6xxx","priority":5,"due_date":"2026-08-12T09:00:00+0000"}'`
+        - Add a high-priority subtask with title/content operations and a due date:
+            `tick-proxy do subtask-create '{"title_ops":[{"op":"insert","insert_lines":[0],"insert_text":"Review"}],"content_ops":[{"op":"insert","insert_lines":[0],"insert_text":"Check sources"}],"parent_id":"68e0","project_id":"6xxx","priority":5,"due_date":"2026-08-12T09:00:00+0000"}'`
             → {"id":"68f2","title":"Review","parentId":"68e0","priority":5}
     """
+    task_payload = p.model_dump(exclude={"parent_id"}, exclude_none=True)
     created = task_create(
         client,
-        TaskCreatePayload(**p.model_dump(exclude={"parent_id"}, exclude_none=True)),
+        TaskCreatePayload(
+            **materialize_document_fields({}, task_payload, require_title=True)
+        ),
     )
     task_id = created["id"]
     client.v2_post(
@@ -240,44 +283,39 @@ def subtask_create(
 
 
 ACTIONS = [
-    ActionDef(
+    action_def(
         "task-batch-create",
         BatchCreatePayload,
         task_batch_create,
         v2=True,
         group="Batch",
     ),
-    ActionDef(
+    action_def(
         "task-batch-update",
         BatchUpdatePayload,
         task_batch_update,
         v2=True,
         group="Batch",
     ),
-    ActionDef(
+    action_def(
         "task-batch-delete",
         BatchDeletePayload,
         task_batch_delete,
-        hitl=True,
         v2=True,
         group="Batch",
     ),
-    ActionDef(
-        "task-move", MovePayload, task_move, verify="always", v2=True, group="Batch"
-    ),
+    ActionDef("task-move", MovePayload, task_move, v2=True, group="Batch"),
     ActionDef(
         "task-parent-set",
         ParentSetPayload,
         task_parent_set,
-        verify="always",
         v2=True,
         group="Batch",
     ),
-    ActionDef(
+    action_def(
         "subtask-create",
         SubtaskCreatePayload,
         subtask_create,
-        verify="always",
         v2=True,
         group="Batch",
     ),

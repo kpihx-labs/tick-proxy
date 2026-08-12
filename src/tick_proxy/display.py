@@ -12,6 +12,7 @@ from rich.panel import Panel
 from rich.table import Table
 
 console = Console()
+stderr_console = Console(stderr=True)
 
 
 def print_json(data: Any) -> None:
@@ -86,7 +87,7 @@ def print_warning(message: str) -> None:
         >>> print_warning("V2 unavailable — tags and habits will fail")
         ⚠️  V2 unavailable — tags and habits will fail
     """
-    console.print(f"[bold yellow]⚠️  {message}[/bold yellow]")
+    stderr_console.print(f"[bold yellow]⚠️  {message}[/bold yellow]")
 
 
 def print_error(message: str) -> None:
@@ -104,7 +105,7 @@ def print_error(message: str) -> None:
         >>> print_error("[401] V1 API token expired")
         ❌ [401] V1 API token expired
     """
-    console.print(f"[bold red]❌ {message}[/bold red]")
+    stderr_console.print(f"[bold red]❌ {message}[/bold red]")
 
 
 def print_success(message: str) -> None:
@@ -122,15 +123,14 @@ def print_success(message: str) -> None:
         >>> print_success("tick-proxy configured")
         ✅ tick-proxy configured
     """
-    console.print(f"[bold green]✅ {message}[/bold green]")
+    stderr_console.print(f"[bold green]✅ {message}[/bold green]")
 
 
 def print_meta(meta: dict) -> None:
     """Render the `meta` section of an envelope as a panel.
 
     Args:
-        meta (dict): The envelope meta — `status`, `comment`, `edited`,
-            and optionally `verification`.
+        meta (dict): The envelope meta — `status`, `comment`, and `edited`.
 
     Returns:
         None
@@ -143,17 +143,11 @@ def print_meta(meta: dict) -> None:
     """
     status = meta.get("status", "ok")
     color = "green" if status in ("ok", "approved") else "red"
-    verification = meta.get("verification")
-    verif_line = ""
-    if verification:
-        ok = verification.get("ok")
-        verif_line = f"\n[bold]Verified:[/] {'✅ Yes' if ok else '❌ NO'}"
     console.print(
         Panel(
             f"[bold {color}]Status:[/] {status}\n"
             f"[bold]Comment:[/] {meta.get('comment', '') or '(empty)'}\n"
-            f"[bold]Edited:[/] {'✅ Yes' if meta.get('edited') else '❌ No'}"
-            f"{verif_line}",
+            f"[bold]Edited:[/] {'✅ Yes' if meta.get('edited') else '❌ No'}",
             title="[bold blue]Output Meta[/]",
             border_style=color,
         )

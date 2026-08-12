@@ -5,7 +5,15 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 from ..client import TickClient
-from .base import ActionDef
+from ..task_documents import DocumentOperations
+from .base import (
+    ActionDef,
+    action_def,
+    require_approval,
+    require_preflight,
+    require_reviews,
+    require_verification,
+)
 
 
 def _reminders(minutes: list[int] | None) -> list[str] | None:
@@ -39,11 +47,13 @@ def _reminders(minutes: list[int] | None) -> list[str] | None:
     return out
 
 
-class TaskCreatePayload(BaseModel):
-    title: str = Field(..., description="Task title")
+class TaskCreatePayload(DocumentOperations):
+    title: str | None = Field(None, description="Final title derived from title_ops")
     project_id: str | None = Field(None, description="Target project id; omit → Inbox")
-    content: str | None = Field(None, description="Body / description")
-    desc: str | None = Field(None, description="Checklist description field")
+    content: str | None = Field(None, description="Final body derived from content_ops")
+    desc: str | None = Field(
+        None, description="Final description derived from desc_ops"
+    )
     priority: int = Field(0, description="0=none 1=low 3=medium 5=high")
     due_date: str | None = Field(
         None, description="ISO 8601, e.g. 2026-08-12T09:00:00+0000"
@@ -63,6 +73,9 @@ class TaskCreatePayload(BaseModel):
     column_id: str | None = Field(None, description="Kanban column id")
 
 
+@require_reviews
+@require_approval("task")
+@require_verification("title", "content", "desc")
 def task_create(client: TickClient, p: TaskCreatePayload) -> dict:
     """Create a task.
 
@@ -72,7 +85,8 @@ def task_create(client: TickClient, p: TaskCreatePayload) -> dict:
     V1 anchors the trigger on the due date, and drops the reminder without it.
 
     Parameters:
-        - title (str): Task title.
+        - title_ops/content_ops/desc_ops: Ordered `replace` or `insert` document
+          operations. Raw `title`, `content`, and `desc` are rejected at the CLI.
         - project_id (str|null): Target project; omit → Inbox.
         - priority (int): 0=none, 1=low, 3=medium, 5=high.
         - due_date/start_date (str|null): ISO 8601. time_zone: IANA name.
@@ -82,14 +96,20 @@ def task_create(client: TickClient, p: TaskCreatePayload) -> dict:
         - recurrence (str|null): RRULE string. column_id (str|null): kanban column.
 
     Examples:
-        - Simple task in the Inbox:
-            `tick-proxy do task-create '{"title":"Buy bread"}'`
-            → {"id":"68f1a2b3c4d5e6f708192a3b","title":"Buy bread","projectId":"inbox1275839472"}
-        - High-priority task with a reminder one day before:
-            `tick-proxy do task-create '{"title":"Ship v1","project_id":"6xxx","priority":5,"due_date":"2026-08-12T09:00:00+0000","time_zone":"Europe/Paris","reminder_minutes":[1440]}'`
-            → {"id":"68f1a2b3c4d5e6f708192a3c","title":"Ship v1","priority":5,"reminders":["TRIGGER:-P1D"]}
+        - Create an Inbox task with the required empty-document title insertion:
+            `tick-proxy do task-create '{"title_ops":[{"op":"insert","insert_lines":[0],"insert_text":"Buy bread"}]}'`
+            → HITL, then `data.title="Buy bread"` and three independent diffs.
+        - Create a NOTE with title, multiline content and description insertions:
+            `tick-proxy do task-create '{"kind":"NOTE","title_ops":[{"op":"insert","insert_lines":[0],"insert_text":"Spinoza"}],"content_ops":[{"op":"insert","insert_lines":[0],"insert_text":"- Conatus\n- Joie"}],"desc_ops":[{"op":"insert","insert_lines":[0],"insert_text":"Philosophie"}]}'`
+            → HITL with three inline frames; each inserted field has its own final diff.
+        - Create a high-priority dated task with title insertion and a reminder:
+            `tick-proxy do task-create '{"project_id":"6xxx","priority":5,"due_date":"2026-08-12T09:00:00+0000","time_zone":"Europe/Paris","reminder_minutes":[1440],"title_ops":[{"op":"insert","insert_lines":[0],"insert_text":"Ship v1"}]}'`
+            → `data.title="Ship v1"`, `data.diff.title_diff` and `TRIGGER:-P1D`.
+        - Reject a raw title before HITL (agents must read and emit operations):
+            `tick-proxy do task-create '{"title":"Forbidden raw title"}'`
+            → exit 1: `title_ops required`.
     """
-    body: dict[str, Any] = {"title": p.title}
+    body: dict[str, Any] = {"title": p.title or ""}
     if p.project_id:
         body["projectId"] = p.project_id
     for src, dst in (
@@ -123,6 +143,25 @@ class TaskIdPayload(BaseModel):
     project_id: str = Field(..., description="Project containing the task")
 
 
+def _require_task(client: TickClient, project_id: str, task_id: str) -> None:
+    """Ensure a task exists before an irreversible approval can be shown.
+
+    Args:
+        client (TickClient): Authenticated V1 client used for the task read.
+        project_id (str): Project containing the task.
+        task_id (str): Task identifier that must exist.
+
+    Returns:
+        None: Returns normally when TickTick returns the task.
+
+    Examples:
+        >>> _require_task(type("C", (), {"v1_get": lambda *_: {"id": "t1"}})(), "p1", "t1")
+        >>> bool("task_id")
+        True
+    """
+    client.v1_get(f"/project/{project_id}/task/{task_id}")
+
+
 class TaskUpdatePayload(TaskCreatePayload):
     task_id: str = Field(..., description="Task id to update")
     project_id: str = Field(..., description="Project containing the task")  # type: ignore[assignment]
@@ -130,6 +169,9 @@ class TaskUpdatePayload(TaskCreatePayload):
     status: int | None = Field(None, description="0=active 2=completed")
 
 
+@require_reviews
+@require_approval("task")
+@require_verification("title", "content", "desc")
 def task_update(client: TickClient, p: TaskUpdatePayload) -> dict:
     """Update a task (read-modify-write — only the fields you pass change).
 
@@ -139,18 +181,26 @@ def task_update(client: TickClient, p: TaskUpdatePayload) -> dict:
 
     Parameters:
         - task_id (str), project_id (str): required identifiers.
-        - title/content/desc/priority/due_date/start_date/time_zone/tags/
-          all_day/kind/recurrence/column_id: same semantics as `task-create`.
+        - title_ops/content_ops/desc_ops: ordered exact document operations; raw
+          title/content/desc values are rejected before HITL.
+        - priority/due_date/start_date/time_zone/tags/all_day/kind/recurrence/
+          column_id: same semantics as `task-create`.
         - status (int|null): 0=active, 2=completed.
         - reminder_minutes (list[int]|null): pass [] to clear all reminders.
 
     Examples:
-        - Raise the priority:
-            `tick-proxy do task-update '{"task_id":"68f1","project_id":"6xxx","priority":5}'`
-            → {"id":"68f1","priority":5,"title":"Ship v1"}
-        - Set a 2-day reminder (with the mandatory due-date anchor):
-            `tick-proxy do task-update '{"task_id":"68f1","project_id":"6xxx","due_date":"2026-08-12T09:00:00+0000","time_zone":"Europe/Paris","reminder_minutes":[2880]}'`
-            → {"id":"68f1","reminders":["TRIGGER:-P2D"]}
+        - Replace one exact title line after reading the task:
+            `tick-proxy do task-update '{"task_id":"68f1","project_id":"6xxx","title_ops":[{"op":"replace","old_str":"Old title","old_lines":[1],"new_str":"New title"}]}'`
+            → preflight checks line 1, then `data.diff.title_diff` is the final patch.
+        - Replace two content lines with one exact block:
+            `tick-proxy do task-update '{"task_id":"68f1","project_id":"6xxx","content_ops":[{"op":"replace","old_str":"- old one\n- old two","old_lines":[3,4],"new_str":"- new"}]}'`
+            → stale line text aborts before HITL; otherwise the content diff is shown inline.
+        - Combine a replacement and an insertion in declaration order:
+            `tick-proxy do task-update '{"task_id":"68f1","project_id":"6xxx","content_ops":[{"op":"replace","old_str":"Draft","old_lines":[1],"new_str":"Final"},{"op":"insert","insert_lines":[1],"insert_text":"Reviewed by Ivann"}]}'`
+            → right-side inline editor starts with `Final\nReviewed by Ivann`.
+        - Insert a description after an exact existing line while changing metadata:
+            `tick-proxy do task-update '{"task_id":"68f1","project_id":"6xxx","priority":5,"desc_ops":[{"op":"insert","insert_lines":[2],"insert_text":"Follow up Friday"}]}'`
+            → title/content/desc final values and their three diffs return in `data`.
     """
     current = client.v1_get(f"/project/{p.project_id}/task/{p.task_id}")
     body: dict[str, Any] = {"id": p.task_id, "projectId": p.project_id}
@@ -223,6 +273,13 @@ def task_reopen(client: TickClient, p: TaskIdPayload) -> dict:
     )
 
 
+@require_approval()
+@require_preflight(
+    check=lambda client, payload: _require_task(
+        client, payload.project_id, payload.task_id
+    ),
+    identity_fields=("project_id", "task_id"),
+)
 def task_delete(client: TickClient, p: TaskIdPayload) -> dict:
     """Delete a task permanently. IRREVERSIBLE — HITL required.
 
@@ -318,11 +375,21 @@ def inbox_list(client: TickClient, p: InboxListPayload) -> dict:
 
 
 ACTIONS = [
-    ActionDef("task-create", TaskCreatePayload, task_create, group="Tasks"),
-    ActionDef("task-update", TaskUpdatePayload, task_update, group="Tasks"),
+    action_def(
+        "task-create",
+        TaskCreatePayload,
+        task_create,
+        group="Tasks",
+    ),
+    action_def(
+        "task-update",
+        TaskUpdatePayload,
+        task_update,
+        group="Tasks",
+    ),
     ActionDef("task-complete", TaskIdPayload, task_complete, group="Tasks"),
     ActionDef("task-reopen", TaskIdPayload, task_reopen, group="Tasks"),
-    ActionDef("task-delete", TaskIdPayload, task_delete, hitl=True, group="Tasks"),
+    action_def("task-delete", TaskIdPayload, task_delete, group="Tasks"),
     ActionDef("task-info", TaskIdPayload, task_info, group="Tasks"),
     ActionDef("project-tasks", ProjectTasksPayload, project_tasks, group="Tasks"),
     ActionDef("inbox-list", InboxListPayload, inbox_list, v2=True, group="Tasks"),

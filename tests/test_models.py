@@ -3,8 +3,9 @@
 from tick_proxy.models import OutputMeta, Verification, ok, rejected
 
 
-def test_meta_has_no_verified_field():
+def test_meta_has_no_verification_fields():
     assert "verified" not in OutputMeta().model_dump()
+    assert "verification" not in OutputMeta().model_dump()
 
 
 def test_default_meta():
@@ -12,18 +13,17 @@ def test_default_meta():
         "status": "ok",
         "comment": "",
         "edited": False,
-        "verification": None,
     }
 
 
 def test_ok_envelope():
     env = ok({"id": "68f1"})
     assert env["meta"]["status"] == "ok"
-    assert env["meta"]["verification"] is None
+    assert "verification" not in env["meta"]
     assert env["data"] == {"id": "68f1"}
 
 
-def test_ok_envelope_with_verification():
+def test_verification_lives_in_data_only():
     v = Verification(
         method="GET /task/68f1",
         checked=["parentId"],
@@ -31,9 +31,9 @@ def test_ok_envelope_with_verification():
         actual={"parentId": "68e0"},
         ok=True,
     )
-    env = ok({"id": "68f1"}, v)
-    assert env["meta"]["verification"]["ok"] is True
-    assert "verification" not in env["data"]
+    env = ok({"id": "68f1", "verification": v.model_dump()})
+    assert "verification" not in env["meta"]
+    assert env["data"]["verification"]["ok"] is True
 
 
 def test_rejected_envelope():

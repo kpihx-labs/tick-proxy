@@ -5,7 +5,8 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 from ..client import TickClient
-from .base import ActionDef
+from ..exceptions import TickProxyError
+from .base import ActionDef, action_def, require_approval, require_preflight
 
 
 class EmptyPayload(BaseModel):
@@ -109,6 +110,65 @@ class TagMergePayload(BaseModel):
     target: str = Field(..., description="Tag merged INTO (kept)")
 
 
+def _require_tags(client: TickClient, *names: str) -> None:
+    """Ensure each named tag exists before a destructive approved operation.
+
+    Args:
+        client (TickClient): Authenticated client used for the V2 tag list read.
+        *names (str): One or more tag names that must be present.
+
+    Returns:
+        None: Returns normally only when every normalized name exists.
+
+    Raises:
+        TickProxyError: When any requested tag is absent or duplicated in a merge.
+
+    Examples:
+        >>> _require_tags(type("C", (), {"v2_get": lambda *_: [{"name": "work"}]})(), "work")
+        >>> _require_tags(type("C", (), {"v2_get": lambda *_: [{"name": "work"}]})(), "missing")
+        Traceback (most recent call last):
+        ...
+        tick_proxy.exceptions.TickProxyError: Tag not found: missing.
+    """
+    available = {str(tag.get("name", "")).lower() for tag in client.v2_get("/tags")}
+    missing = [name for name in names if name.lower() not in available]
+    if missing:
+        raise TickProxyError(f"Tag not found: {', '.join(missing)}.")
+
+
+def _require_merge_tags(client: TickClient, source: str, target: str) -> None:
+    """Ensure a tag merge has two distinct existing endpoints before HITL.
+
+    Args:
+        client (TickClient): Authenticated V2 client used to list tags.
+        source (str): Tag that will disappear.
+        target (str): Tag that will remain.
+
+    Returns:
+        None: Returns normally only for distinct existing tag names.
+
+    Raises:
+        TickProxyError: When source and target name the same tag.
+
+    Examples:
+        >>> _require_merge_tags(type("C", (), {"v2_get": lambda *_: [{"name": "one"}, {"name": "two"}]})(), "one", "two")
+        >>> _require_merge_tags(type("C", (), {"v2_get": lambda *_: [{"name": "one"}]})(), "one", "one")
+        Traceback (most recent call last):
+        ...
+        tick_proxy.exceptions.TickProxyError: Tag merge source and target must differ.
+    """
+    if source.lower() == target.lower():
+        raise TickProxyError("Tag merge source and target must differ.")
+    _require_tags(client, source, target)
+
+
+@require_approval()
+@require_preflight(
+    check=lambda client, payload: _require_merge_tags(
+        client, payload.source, payload.target
+    ),
+    identity_fields=("source", "target"),
+)
 def tag_merge(client: TickClient, p: TagMergePayload) -> dict:
     """Merge one tag into another — the source tag is DELETED. HITL required.
 
@@ -132,6 +192,11 @@ class TagDeletePayload(BaseModel):
     name: str = Field(..., description="Tag name to delete")
 
 
+@require_approval()
+@require_preflight(
+    check=lambda client, payload: _require_tags(client, payload.name),
+    identity_fields=("name",),
+)
 def tag_delete(client: TickClient, p: TagDeletePayload) -> dict:
     """Delete a tag and remove it from every task. IRREVERSIBLE — HITL required.
 
@@ -154,10 +219,6 @@ ACTIONS = [
     ActionDef("tag-list", EmptyPayload, tag_list, v2=True, group="Tags"),
     ActionDef("tag-create", TagCreatePayload, tag_create, v2=True, group="Tags"),
     ActionDef("tag-update", TagUpdatePayload, tag_update, v2=True, group="Tags"),
-    ActionDef(
-        "tag-merge", TagMergePayload, tag_merge, hitl=True, v2=True, group="Tags"
-    ),
-    ActionDef(
-        "tag-delete", TagDeletePayload, tag_delete, hitl=True, v2=True, group="Tags"
-    ),
+    action_def("tag-merge", TagMergePayload, tag_merge, v2=True, group="Tags"),
+    action_def("tag-delete", TagDeletePayload, tag_delete, v2=True, group="Tags"),
 ]

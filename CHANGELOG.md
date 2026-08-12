@@ -1,5 +1,87 @@
 # Changelog
 
+## 2.1.0 — 2026-08-12
+
+- Increased the default HITL timeout from 300 to 600 seconds and renamed every HITL page brand to
+  `Tick-Proxy`.
+- Replaced the former always-verify policy plus `ActionDef.verify="always"` with declarative
+  `@require_verification(...)`; all verification proof now appears only as `data.verification`.
+  `meta` now contains only status, comment, and edited—never a meaningless `verification:null`.
+- Added verification declarations for task create/update title/content/desc, alongside the existing
+  parent, move, project, and habit protections.
+- Hardened `project-delete`: exactly one V2 batch deletion follows a successful pre-read; eventual V1
+  post-delete `404` **or empty `{}`** confirms absence through bounded polling. Already absent
+  projects fail before HITL, preventing duplicate delete reviews.
+- Generalized the same declared preflight/identity lock to task and batch deletion, tag deletion and
+  merge, habit deletion, and destructive folder/column mutations. Nonexistent, duplicate, or
+  reviewer-swapped targets cannot reach HITL.
+- Made `subtask-create` a full task-document review: one HITL page, title/content/desc diffs, create,
+  parent link, and final read-back verification including `parentId`. Standardized rejected HITL output
+  for `do` and `admin` while preserving admin's configuration-recovery access. Batch create/update now
+  have one intentionally simple full-JSON HITL review without document diffs.
+## 2.0.0 — 2026-08-12
+
+- Rebuilt task writing around explicit, preflighted document operations. `task-create` and
+  `task-update` now accept `title_ops`, `content_ops`, and `desc_ops`; each operation is either
+  `replace` (`old_str`, mandatory contiguous `old_lines`, `new_str`) or `insert`
+  (`insert_lines`, `insert_text`). Stale/missing text and invalid line ranges fail before HITL.
+- Replaced NOTE-only review with one task review for every `task-create` / `task-update`: the full
+  action JSON is always visible, followed by three editable inline Monaco patch frames for title,
+  content, and description. The final response returns exact persisted `title`, `content`, `desc`,
+  and `data.diff.{title_diff,content_diff,desc_diff}`.
+- Centralized all HITL visual tokens in `templates/hitl.css`; generic and task HITL pages now share
+  the same header, cards, controls, footer, and status states.
+- Added declarative `@require_approval` and `@require_reviews` policies. Every production HITL
+  action now declares `@require_approval`; only task create/update declare `@require_reviews`.
+- Wrapped configuration gating so every `do` stops cleanly with JSON-safe stderr guidance when its
+  config or required V2 session is invalid.
+- Made the complete task JSON genuinely editable: it is parsed at approval, its non-document
+  changes are preserved, and the three inline editors override only title/content/desc. Final
+  title/content/desc and their three diffs are read back from TickTick before the envelope is
+  emitted, so output reflects persisted state rather than local intent.
+
+## 1.2.0 — 2026-08-12
+
+- Replaced the handmade NOTE review form with the same native Monaco `DiffEditor` model used by
+  `ts-proxy`: immutable original Markdown on the left, editable proposed Markdown on the right,
+  and live side-by-side colored additions/removals.
+- The browser submits only Monaco's modified-side note content. The server preserves all locked and
+  non-editor document fields when rebuilding the final TickTick payload, so `data.diff` contains
+  only actual text changes rather than false title/description deletions.
+- Made review actions explicit: the server begins serving before opening the review URL, Approve is
+  disabled until Monaco is ready, Reject remains available, and submit failures stay visible in the
+  page instead of silently doing nothing.
+- Verified with a real TickTick NOTE update and remote read-back on `Le Miracle Spinoza`; the final
+  response and autosave contained precisely the applied two-line unified diff.
+
+## 1.1.1 — 2026-08-12
+
+- Fixed the HITL port-allocation race: the HTTP server now binds directly to OS-assigned port `0`
+  and derives the published review URL from that server's actual bound address, rather than
+  reserving and releasing a port before starting the server.
+
+## 1.1.0 — 2026-08-12
+
+- Made `task-create` and `task-update` mandatory HITL actions; there is no optional review flag.
+- Added the dedicated locked note-diff page for TickTick NOTE creates and updates: original is
+  read-only, only title/content/description are editable, and task/project routing stays locked.
+- Approved note writes add exactly one `data.diff` field containing the actual unified
+  original-to-submitted document delta. The response `meta` remains unchanged: no `meta.review`.
+- Kept standard JSON review for non-NOTE task writes and moved HITL/autosave progress messages to
+  stderr so JSON output remains pipe-safe.
+- Added mocked end-to-end coverage for note create/update, locked IDs, human-edited submissions,
+  generic non-note review, and the data-only diff contract.
+
+## 1.0.1 — 2026-08-12
+
+- Repaired V2 session refresh: sign-on, MFA and the V2 status probe now share canonical TickTick
+  browser headers, including `X-Device`.
+- Matched MFA verification to the reference flow: `wc=true&remember=true`, `x-verify-id` header,
+  and `{code, method:"app"}` body without `authId`.
+- Added safe email/device approval-link handling, safe JSON error classification for
+  `access_forbidden`, and mocked request-shape coverage. No credentials, tokens or server error
+  bodies are persisted or surfaced.
+
 ## Unreleased — 0.1.0 (design)
 
 ### Architecture contract drafted — refonte of `tick-mcp` into `tick-proxy`
@@ -57,7 +139,7 @@ Applied on top of the skeleton, patch-edit, following KπX's exact orders:
   (`logger.py` → systemd/journald captures), no file, no rotation, no `TICK_LOG_LEVEL` env var.
   `admin` is now exactly: `setup`, `status`, `session-refresh`.
 - **TickTick password NEVER stored.** `.env` holds at most `TICK_API_TOKEN`, `TICK_SESSION_TOKEN`
-  and `TICK_USERNAME` (the account e-mail, optional, kept only to pre-fill the refresh form). The
+  and `TICK_EMAIL` (the account e-mail, optional, kept only to pre-fill the refresh form). The
   password exists only inside the `admin session-refresh` HITL form, is exchanged for a new session
   token via `POST /user/signon`, and is discarded immediately. Credentials (username + password)
   are requested **only when the session token is invalid** — never otherwise. The stored-password
@@ -113,3 +195,12 @@ Applied on top of the skeleton, patch-edit, following KπX's exact orders:
   `services/` package. Rationale: after the presets purge, `services/` held exactly one module —
   a one-file folder was unnecessary weight. Architecture tree, `query.py` roles section, ported
   list, P4 plan, AGENTS.md Key Files and TODO.md updated accordingly.
+
+### Design refinement pass 5 (2026-08-09 — KπX directive)
+
+- **`TICK_USERNAME` renamed to `TICK_EMAIL` everywhere.** Renamed the environment variable name
+  from `TICK_USERNAME` to `TICK_EMAIL` across all configurations, code constants, docstrings,
+  examples, and markdown files (`config.py` constant `ENV_EMAIL = "TICK_EMAIL"`, helper function
+  `get_email()`, k-tick skill files, etc.) to clarify that the login identifier is the e-mail address.
+  The refresh flow (`admin session-refresh` HITL form keys and `/user/signon` API payload keys)
+  remains unchanged as `username` for compatibility with the TickTick API.

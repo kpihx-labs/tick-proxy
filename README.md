@@ -2,9 +2,8 @@
 
 TickTick administrative proxy — RPC CLI for tasks, projects, habits, tags, focus and query views.
 
-> **Status:** 🟡 **DESIGN — not implemented yet.** This repository currently holds only the
-> architecture contract and the agent context. See `CONTRACT.md` for the full design and the
-> list of decisions awaiting validation.
+> **Status:** 🟢 **IMPLEMENTED — 52 actions.** See `CONTRACT.md` for the authoritative action,
+> HITL, verification, and transport contracts.
 
 Refonte of [`tick-mcp`](https://github.com/kpihx/tick-mcp) (MCP server, 71 tools) into a non-MCP
 CLI built on the exact model of [`tg-proxy`](https://github.com/KpihX/tg-proxy).
@@ -56,14 +55,17 @@ Full catalog with source-tool mapping, auth level (V1/V2) and HITL requirement: 
 tick-proxy do --help                 # compact overview of all 52 actions
 tick-proxy do task-create --help     # full docstring + exact payload schema
 
-# Payload: inline JSON or a file path
-tick-proxy do task-create '{"title":"Buy bread","priority":3}'
+# Payload: inline JSON or a file path. Task writes use checked document operations and always require HITL.
+tick-proxy do task-create '{"priority":3,"title_ops":[{"op":"insert","insert_lines":[0],"insert_text":"Buy bread"}]}'
 tick-proxy do task-create ./payload.json
+
+# Every task kind opens the same editable JSON and three field-local patch reviews.
+tick-proxy do task-update '{"task_id":"task-1","project_id":"project-1","content_ops":[{"op":"replace","old_str":"Draft","old_lines":[1],"new_str":"Final wording"}]}'
 
 # Meta options
 tick-proxy do view-today -f table            # table instead of JSON
 tick-proxy do query-tasks ./filter.json -o /tmp/result.json
-# (verification is NOT a CLI option — it runs automatically via the @always_verify decorator)
+# (verification is NOT a CLI option — it runs automatically via @require_verification)
 ```
 
 ### Meta options (`do` only)
@@ -74,7 +76,7 @@ tick-proxy do query-tasks ./filter.json -o /tmp/result.json
 | `--format json\|table` / `-f` | Display format (default: `json`) |
 | `--help` / `-h` | Full docstring + payload schema |
 
-> **No `--verify/-V` flag.** Verification is structural — the `@always_verify` decorator on the
+> **No `--verify/-V` flag.** Verification is structural — the `@require_verification` decorator on the
 > handler runs it automatically. See `CONTRACT.md` → **Verification model**.
 
 ---
@@ -88,8 +90,7 @@ Every response carries a `meta` section:
   "meta": {
     "status": "ok",
     "comment": "",
-    "edited": false,
-    "verification": null
+    "edited": false
   },
   "data": { }
 }
@@ -108,7 +109,7 @@ Single `.env` at `~/.config/tick-proxy/.env`, created by `tick-proxy admin setup
 ```env
 TICK_API_TOKEN=6f8a1c2e-4b7d-4e9f-8a1b-2c3d4e5f6a7b   # V1 Open API (required)
 TICK_SESSION_TOKEN=a1b2c3d4e5f60718293a4b5c6d7e8f90   # V2 web API cookie (optional)
-TICK_USERNAME=kapoivha@gmail.com                      # account e-mail (optional) — pre-fills the session-refresh form
+TICK_EMAIL=user@example.com                           # account e-mail (optional) — pre-fills the session-refresh form
 ```
 
 - **V1** (`TICK_API_TOKEN`) — official Open API: tasks, projects.
@@ -117,8 +118,12 @@ TICK_USERNAME=kapoivha@gmail.com                      # account e-mail (optional
 
 **The TickTick password is never stored.** It is collected transiently by
 `tick-proxy admin session-refresh` (HITL), exchanged for a new session token, then discarded —
-exactly like `tg-proxy` never persists credentials. Only the e-mail (`TICK_USERNAME`) may be
+exactly like `tg-proxy` never persists credentials. Only the e-mail (`TICK_EMAIL`) may be
 kept, and only to pre-fill the refresh form.
+
+When TickTick requires verification, the refresh form requests either an MFA code or a confirmation
+that the operator clicked TickTick's device-approval email link. Login requests use TickTick's
+canonical web headers; server error bodies and credentials are never displayed or persisted.
 
 Every endpoint, header and timeout has a documented default in `config.py` and is overridable from
 the same `.env`. See `.env.example` for the fully commented template.
@@ -134,14 +139,31 @@ chmod 600 ~/.config/tick-proxy/.env
 
 ## HITL
 
-Human-in-the-Loop via a local web UI. Destructive and secret-touching operations open a browser
-page showing the payload for review, editing, and approval/rejection.
+Human-in-the-Loop via a local web UI. Task creation and updates, destructive, and secret-touching
+operations open a browser page for review, editing, and approval/rejection.
 
-**HITL-required:** `task-delete` · `task-batch-delete` · `project-delete` · `tag-delete` ·
-`tag-merge` · `habit-delete` · `folder-manage`/`column-manage` (when the payload
-contains `delete`) · `raw` · `admin setup` · `admin session-refresh`.
+**HITL-required:** `task-create` · `task-update` · `subtask-create` · `task-batch-create` · `task-batch-update` · `task-delete` · `task-batch-delete` · `project-delete` · `tag-delete` ·
+`tag-merge` · `habit-delete` · `folder-manage` · `column-manage` · `raw` · `admin setup` · `admin session-refresh`.
 
-Everything else (creates, updates, reads, views) runs without prompting.
+Every destructive delete, tag merge, or folder/column deletion pre-reads and locks its target identity
+before HITL: an absent, duplicate, or reviewer-swapped target fails without opening a review page.
+`project-delete` then sends only one delete after approval and polls the V1 resource view until TickTick
+reports `404` or its observed empty `{}` post-delete representation.
+
+`task-create` / `task-update` / `subtask-create` use one structured task review for every TickTick kind. Their payload
+contains normal task metadata plus `title_ops`, `content_ops`, and `desc_ops`; raw document fields
+are refused. Each operation is a checked `replace` (`old_str`, `old_lines`, `new_str`) or `insert`
+(`insert_lines`, `insert_text`), so stale agent context stops before HITL. The page keeps full JSON
+editable and shows three editable inline Monaco patches—title, content, description—before the
+common approve/reject controls. On approval, that JSON is parsed as the complete final payload and
+the three patch editors replace only its `title`, `content`, and `desc` values. The approved response returns exact final `title`, `content`,
+`desc`, plus `data.diff.title_diff`, `content_diff`, and `desc_diff`; no `meta.review` exists.
+
+`task-batch-create` and `task-batch-update` use one standard editable full-JSON HITL review. They
+intentionally preserve the native V2 batch shape without per-field document diffs: reject unclear
+text edits and ask for individual `task-*` / `subtask-create` operations instead.
+
+Everything else (reads, views and non-listed writes) runs without prompting.
 
 ---
 

@@ -9,9 +9,8 @@ HITL web UI, autosave. **No Docker, no MCP transport, no daemon.**
 
 **Design reference: `CONTRACT.md` — read it before touching anything.**
 
-> **Status:** 🟡 DESIGN. Only the Markdown skeleton exists. No source code, no `pyproject.toml`,
-> no git repo yet — the 11 decisions in `CONTRACT.md` → *Decisions requiring KπX validation*
-> must be validated first.
+> **Status:** 🟢 IMPLEMENTED. The registry contains 52 actions and `make check` is the mandatory
+> quality gate. `CONTRACT.md` remains the architecture contract.
 
 ## Overview
 
@@ -48,14 +47,31 @@ tick-proxy admin setup|status|session-refresh                     # ALWAYS JSON
 - **Adding an action = adding ONE `ActionDef`.** Never register a command directly in `cli.py`.
 - **The docstring IS the documentation.** Mandatory sections: description, `Parameters:`, `Examples:`
   with real `→` outputs. `doc.py` renders them into `--help`; there is no second doc surface.
-- **Envelope always.** `{"meta":{"status","comment","edited","verification"},"data":…}` — errors exit 1,
+- **Envelope always.** `{"meta":{"status","comment","edited"},"data":…}` — errors exit 1,
   admin misuse (`--format`/`-o`) exits 2.
 - **Verification is not optional for the 4 silent-failure ops** — `task-parent-set`,
   `project-create`/`project-update` with `group_id`, `habit-update`, `task-move`. It is enforced by
-  the **`@always_verify` decorator** on the handler — no flag, no bypass. There is **no `verified`
-  field in `meta`**: the presence of a non-empty `meta.verification` means verified, `{}`/absent
-  means not verified.
+  the **`@require_verification` decorator** on the handler — no flag, no bypass. There is no
+  verification field in `meta`: only verified actions add a proof at `data.verification`.
 - **No Docker, ever** in this repo (explicit KπX decision — the `tg-proxy` Docker layer is untested).
+- **Every HITL declaration is visible.** A handler requiring review must carry
+  `@require_approval`; `action_def()` derives HITL policy from it. Never use `hitl=True` directly
+  in a production action definition. `task-create` / `task-update` / `subtask-create` additionally carry
+   `@require_reviews`, the exclusive marker for the three document frames.
+- **Irreversible HITL starts with a locked preflight.** Every delete or destructive merge carries
+  `@require_preflight(check=..., identity_fields=...)`: it reads every destructive target before a review page
+  can open, then rejects a reviewer-edited target identity. The approved write only acts on the
+  preflighted resource; absent IDs never consume a HITL cycle.
+- **Task writes are operation-first.** `task-create` / `task-update` / `subtask-create` never accept raw title,
+  content, or desc input: the three explicit operation lists are preflighted against the fresh
+  document before HITL. The shared task page keeps one fully editable complete JSON payload and
+  provides three editable inline Monaco patches that override only title/content/desc on submit.
+  Final output includes exact `title`, `content`, `desc` and the three
+  field-local diffs below `data.diff`; never add `meta.review` or an audit wrapper.
+- **Batch task writes are intentionally simple but reviewed.** `task-batch-create` and
+  `task-batch-update` use one editable full-JSON HITL page and preserve the native V2 payload,
+  including text fields. They deliberately do not create per-field document diffs: reject unclear
+  bulk text changes and use individual `task-*` or `subtask-create` actions instead.
 
 ## TickTick API gotchas (silent failures — no error, data simply not saved)
 
@@ -66,6 +82,14 @@ tick-proxy admin setup|status|session-refresh                     # ALWAYS JSON
 | Update habit | V2 `/habits/batch` is a **full replacement** | read-modify-write, never a partial payload |
 | Move tasks with children | `move_tasks` does **not** cascade | fetch `childIds`, move parent + children in one batch |
 | Reminders on V2-created tasks | V1 needs `dueDate` as the trigger anchor; without it `reminder_minutes` is dropped | always pass `due_date` + `time_zone` alongside `reminder_minutes` |
+
+## V2 refresh invariants
+
+- Sign-on, MFA verification and the V2 status probe use the shared canonical web header builder.
+- MFA sends `wc=true&remember=true`, `x-verify-id: <authId>`, and `{code, method:"app"}`; `authId`
+  never appears in the JSON body or HITL payload.
+- A long-lived `authId` challenge is an email device-approval link: request acknowledgement through
+  HITL, then retry sign-on once. Credentials remain transient and no server error body is exposed.
 
 ## Commands (once implemented)
 

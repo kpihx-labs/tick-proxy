@@ -1,7 +1,7 @@
 """
 tick-proxy: TickTick administrative proxy — RPC CLI for tasks, projects, habits and queries.
 
-Config: ~/.config/tick-proxy/.env (TICK_API_TOKEN, TICK_SESSION_TOKEN, TICK_USERNAME).
+Config: ~/.config/tick-proxy/.env (TICK_API_TOKEN, TICK_SESSION_TOKEN, TICK_EMAIL).
 The TickTick password is NEVER stored — see `admin session-refresh`.
 """
 

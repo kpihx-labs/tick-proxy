@@ -6,18 +6,41 @@ The 11 decisions in `CONTRACT.md` → *Decisions requiring KπX validation* must
 Summary of what is being asked:
 
 - [ ] **D1** — Action naming flipped to domain-first kebab (`task-create`, not `create-task`)
-- [ ] **D2** — 5 `verified_*` tools folded into the `@always_verify` decorator (no CLI flag) + always-on verification for the 4 silent-failure ops
+- [x] **D2** — `verified_*` tools folded into `@require_verification` (no CLI flag); proof appears only in `data.verification`, including task create/update document fields.
 - [ ] **D3** — `ticktick_guide` dropped in favour of docstring-driven `do --help`
 - [ ] **D4** — `check_v2_availability` folded into `admin status`
 - [ ] **D5** — 8 `tick-admin` credential subcommands folded into ONE `admin setup` HITL form
 - [ ] **D6** — `config.yaml` dropped (documented defaults in `config.py`, overridable via `.env`)
 - [ ] **D7** — Env prefix `TICK_*` (harmonizes with `TG_*`)
 - [ ] **D8** — HTTP transport + Telegram admin bot + PID daemon dropped
-- [ ] **D9** — HITL restricted to deletions + `tag-merge` + `raw` + admin secrets
+- [x] **D9** — HITL now covers deletions + `tag-merge` + `raw` + admin secrets, mandatory
+       `task-create` / `task-update` / `subtask-create`, and simple full-JSON batch task writes;
+       every individual task kind uses full editable JSON plus three inline
+      title/content/desc patches, returning `data.diff.{title_diff,content_diff,desc_diff}` and
+      no `meta.review` wrapper.
 - [ ] **D10** — `actions/` registry layout instead of a monolithic `client.py`
 - [ ] **D11** — `~/Work/AI/MCPs/tick_mcp/` kept as reference until parity, then archived
 
 ## Done (design phase)
+
+- [x] Scoped V2 authentication repair (2026-08-12): canonical login headers, reference-compatible
+       MFA request shape, email device-approval retry, and safe `access_forbidden` reporting covered
+       by mocked tests; no live login performed.
+
+- [x] Task-write HITL v2 architecture (2026-08-12): `task-create` / `task-update` / `subtask-create` always open
+      one shared full-JSON review for every task kind. `title_ops`, `content_ops`, `desc_ops`
+      are exact preflighted `replace`/`insert` lists; the page adds three editable inline Monaco
+      patches. Final output is read back from TickTick and returns title/content/desc plus the
+      three field-local diffs; no `meta.review` exists. Mocked/local HTTP plus real remote update
+       and read-back cover operation preflight, editable JSON metadata, inline edits, and persistence.
+
+- [x] Subtask + batch + outcome harmonization (2026-08-12): `subtask-create` now receives the
+       operation-first task review, then creates, links to `parentId`, and verifies all four final
+       fields. Batch create/update retain native V2 free-form payloads but now have one full-JSON
+       HITL review. Rejections from `do`, task review, and admin all emit the same envelope and exit
+       status, while admin does not use the `do` configuration gate. Real E2E created, reviewed,
+       linked, verified, batch-created/updated, and removed isolated TickTick data; V2
+       `/batch/project` replaced a V1 project deletion path that did not remove live projects.
 
 - [x] Exhaustive analysis of `tg-proxy` ADN — `cli.py` (Typer `do`/`admin`, `_make_rpc` factory,
       autosave, meta options), `client.py` (docstring format), `models.py` (Pydantic payloads),
@@ -44,11 +67,9 @@ Summary of what is being asked:
 - [ ] `Makefile` — `tg-proxy` targets **minus** all `docker-*`
 - [ ] `.gitignore`, `.env.example` (the fully commented block from `CONTRACT.md`), `.gitlab-ci.yml`
       (validate → build → publish, no docker stage)
-- [ ] `scripts/install.sh`, `scripts/uninstall.sh`, `scripts/smoke.sh`
 - [ ] Package directory tree (`src/tick_proxy/{api,actions,services,admin,templates}/`)
 - [ ] `git init` + remotes `github: git@github.com:KpihX/tick-proxy.git`,
       `gitlab: git@gitlab.com:kpihx/tick-proxy.git` + repo creation (`gh`, `glab`)
-- [ ] `make git-install-hooks`
 
 ### P1 — Core
 - [ ] `config.py` — `.env` loader, documented endpoint defaults, all overridable
@@ -84,10 +105,10 @@ Summary of what is being asked:
       `Parameters:` and at least 2 `Examples:` showing real `→` output
 
 ### P5 — Verification engine
-- [ ] `@always_verify` decorator in `actions/base.py` + `ActionDef.verify="always"` field
+- [x] `@require_verification` decorator in `actions/base.py`; no `ActionDef.verify` field
 - [ ] Always-on verification for `task-parent-set`, `project-create`/`project-update` (`group_id`),
       `habit-update`, `task-move`
-- [ ] `meta.verification` block (no `verified` field — presence means verified, `{}`/absent means not)
+- [x] `data.verification` block only for declared verification writes; no meta verification field
 - [ ] **Gate:** verified writes proven live, including a deliberately failing verification
 
 ### P6 — `raw` gateway
@@ -117,5 +138,14 @@ Summary of what is being asked:
       — no preset machinery, code stays 100 % business (KπX decision 2026-08-09)
 - [ ] Should `raw` autosave include the request as well as the response? *(useful for auditing)*
 - [ ] Shell completions — `tg-proxy` deliberately disables them (`add_completion=False` on both
-      Typer apps, no `completions/` directory). Keep that stance for ADN fidelity, or enable
-      Typer's `--install-completion` so the 52 action names become tab-completable?
+       Typer apps, no `completions/` directory). Keep that stance for ADN fidelity, or enable
+       Typer's `--install-completion` so the 52 action names become tab-completable?
+- [ ] **Deferred backlog — native Zsh completions (do not implement yet).** Current unsupported
+      invocation: `tick-proxy --show-completion zsh` → `No such option: --show-completion`.
+      When the CLI implementation and completion policy are validated, expose a native
+      Typer/Click-generated Zsh completion script. If compatible with the chosen mechanism, keep
+      its canonical source in the future `k-tick` skill `assets/` and install it through a local
+      Zsh completion-path symlink; do not create a second maintained copy. Smoke expectation:
+      generation/install is non-interactive, the generated script loads in Zsh, and completion
+      resolves `tick-proxy` namespaces and registered `do` action names without real TickTick
+      authentication.

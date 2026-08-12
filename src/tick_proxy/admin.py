@@ -6,34 +6,39 @@ HITL form, exchanges it for a session token, then drops it.
 """
 
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Any, cast
 
 import httpx
 
 from .config import (
+    CONFIG_DIR,
+    DIR_PERMISSIONS,
     ENV_API_TOKEN,
+    ENV_EMAIL,
     ENV_PATH,
     ENV_SESSION_TOKEN,
     ENV_TOKEN_EXPIRES_AT,
     ENV_TOKEN_OBTAINED_AT,
-    ENV_USERNAME,
+    FILE_PERMISSIONS,
     SESSION_COOKIE_NAME,
     SIGNON_PARAMS,
-    USER_AGENT,
     V2_MFA_VERIFY_PATH,
     V2_SIGNON_PATH,
     api_timeout,
     get_api_token,
+    get_email,
     get_session_token,
-    get_username,
     load_env,
     v1_base_url,
     v2_base_url,
-    web_origin,
+    v2_login_headers,
     write_env,
 )
 from .exceptions import TickProxyError
 from .hitl import request_approval
+from .models import Status
+
+AdminResult = tuple[dict | None, Status, bool, str]
 
 
 def _mask(value: str) -> str:
@@ -56,7 +61,7 @@ def _mask(value: str) -> str:
     return f"{value[:4]}…{value[-5:]}" if len(value) > 12 else "…"
 
 
-def setup() -> dict:
+def setup() -> AdminResult:
     """Collect the three persisted credentials through the HITL web form.
 
     The form shows API token, session token and username. A field left empty is
@@ -64,33 +69,35 @@ def setup() -> dict:
     exists here.
 
     Returns:
-        dict: `{"config": …, "fields": [...]}` describing what was written.
-
-    Raises:
-        TickProxyError: When the reviewer rejects the form.
+        tuple[dict, Status, bool, str]: A tuple containing the written fields dict,
+        the HITL response status, a boolean indicating whether it was edited,
+        and the HITL reviewer comment.
 
     Examples:
-        >>> setup()
-        {'config': '/home/kpihx/.config/tick-proxy/.env', 'fields': ['TICK_API_TOKEN']}
-        >>> setup()
-        {'config': '/home/kpihx/.config/tick-proxy/.env', 'fields': ['TICK_API_TOKEN', 'TICK_USERNAME']}
+        >>> setup()[0]['config']
+        '/home/kpihx/.config/tick-proxy/.env'
     """
     load_env()
     current = {
         ENV_API_TOKEN: get_api_token(),
         ENV_SESSION_TOKEN: get_session_token(),
-        ENV_USERNAME: get_username(),
+        ENV_EMAIL: get_email(),
     }
     response = request_approval("admin setup", current)
     if response.status == "rejected":
-        raise TickProxyError(f"Setup rejected: {response.comment or 'no reason given'}")
+        return None, "rejected", response.edited, response.comment
 
     values = response.payload if isinstance(response.payload, dict) else current
     kept = {k: str(v).strip() for k, v in values.items() if str(v or "").strip()}
     if not kept.get(ENV_API_TOKEN):
         raise TickProxyError(f"{ENV_API_TOKEN} is required — setup aborted.")
     write_env(kept)
-    return {"config": str(ENV_PATH), "fields": sorted(kept)}
+    return (
+        {"config": str(ENV_PATH), "fields": sorted(kept)},
+        cast(Status, response.status),
+        response.edited,
+        response.comment,
+    )
 
 
 def status() -> dict:
@@ -129,7 +136,7 @@ def status() -> dict:
                     f"{v2_base_url()}/user/status",
                     headers={
                         "Cookie": f"{SESSION_COOKIE_NAME}={session_token}",
-                        "User-Agent": USER_AGENT,
+                        **v2_login_headers(),
                     },
                 )
             v2_reachable = r.status_code == 200
@@ -137,6 +144,34 @@ def status() -> dict:
             v2_reachable = False
 
     import os
+    import shutil
+    import sys
+
+    # Check directory permissions (should be DIR_PERMISSIONS)
+    dir_mode = None
+    dir_status = "absent"
+    dir_fix = None
+    if CONFIG_DIR.exists():
+        dir_mode = os.stat(CONFIG_DIR).st_mode & 0o777
+        if dir_mode == DIR_PERMISSIONS:
+            dir_status = "ok"
+        else:
+            dir_status = "warning"
+            dir_fix = f"chmod {oct(DIR_PERMISSIONS)[2:]} {CONFIG_DIR}"
+
+    # Check file permissions (should be FILE_PERMISSIONS)
+    file_mode = None
+    file_status = "absent"
+    file_fix = None
+    if ENV_PATH.exists():
+        file_mode = os.stat(ENV_PATH).st_mode & 0o777
+        if file_mode == FILE_PERMISSIONS:
+            file_status = "ok"
+        else:
+            file_status = "warning"
+            file_fix = f"chmod {oct(FILE_PERMISSIONS)[2:]} {ENV_PATH}"
+
+    binary_path = shutil.which("tick-proxy") or os.path.abspath(sys.argv[0])
 
     return {
         "config": str(ENV_PATH),
@@ -145,10 +180,48 @@ def status() -> dict:
         "v1_reachable": v1_reachable,
         "v2_token": _mask(session_token),
         "v2_reachable": v2_reachable,
-        "username": get_username(),
+        "username": get_email(),
         "token_obtained_at": os.environ.get(ENV_TOKEN_OBTAINED_AT, ""),
         "token_expires_at": os.environ.get(ENV_TOKEN_EXPIRES_AT, ""),
+        "binary": binary_path,
+        "permissions": {
+            "config_dir": {
+                "path": str(CONFIG_DIR),
+                "mode": oct(dir_mode) if dir_mode is not None else None,
+                "status": dir_status,
+                "fix": dir_fix,
+            },
+            "config_file": {
+                "path": str(ENV_PATH),
+                "mode": oct(file_mode) if file_mode is not None else None,
+                "status": file_status,
+                "fix": file_fix,
+            },
+        },
     }
+
+
+def _login_error(response: httpx.Response, action: str) -> TickProxyError:
+    """Return a safe, actionable error for a failed V2 login exchange.
+
+    TickTick may return JSON error payloads. Only the documented
+    ``access_forbidden`` classification is surfaced; arbitrary server text is
+    intentionally never echoed because it can contain account-specific data.
+    """
+    error_code = ""
+    try:
+        body = response.json()
+        if isinstance(body, dict):
+            error_code = str(body.get("errorCode") or body.get("code") or "").lower()
+    except (ValueError, TypeError):
+        pass
+    if error_code == "access_forbidden":
+        return TickProxyError(
+            "TickTick denied this login from the current device or network. "
+            "Approve the sign-in email/link if one was sent, then retry "
+            "'tick-proxy admin session-refresh'."
+        )
+    return TickProxyError(f"{action} failed ({response.status_code}). Please retry.")
 
 
 def _signon(username: str, password: str) -> dict[str, Any]:
@@ -176,45 +249,59 @@ def _signon(username: str, password: str) -> dict[str, Any]:
             f"{v2_base_url()}{V2_SIGNON_PATH}",
             params=SIGNON_PARAMS,
             json={"username": username, "password": password},
-            headers={
-                "Content-Type": "application/json",
-                "User-Agent": USER_AGENT,
-                "Origin": web_origin(),
-                "Referer": f"{web_origin()}/",
-            },
+            headers=v2_login_headers(),
         )
     if r.status_code != 200:
-        raise TickProxyError(f"V2 login failed ({r.status_code}): {r.text[:200]}")
+        raise _login_error(r, "V2 login")
     return r.json()
 
 
-def session_refresh() -> dict:
+def _complete_device_approval(
+    username: str, password: str
+) -> tuple[dict[str, Any] | None, str]:
+    """Wait for an email-link device approval, then retry sign-on once.
+
+    Neither credentials nor ``authId`` enter the review payload or persistent
+    configuration. The user only acknowledges that they opened TickTick's
+    approval link; credentials remain local to this refresh invocation.
+    """
+    response = request_approval(
+        "admin session-refresh (device approval)",
+        {
+            "instruction": "Open TickTick's sign-in approval email and click its link.",
+            "confirm": "",
+        },
+    )
+    if response.status == "rejected":
+        return None, response.comment or "Device approval was not confirmed."
+    return _signon(username, password), ""
+
+
+def session_refresh() -> AdminResult:
     """Obtain a fresh V2 session token — credentials collected transiently.
 
-    Opens the HITL form asking for username (pre-filled from TICK_USERNAME) and
+    Opens the HITL form asking for username (pre-filled from TICK_EMAIL) and
     password. The password is used for exactly one `POST /user/signon` and is
     then dropped; only the resulting token and the e-mail are written to .env.
     A device/2FA challenge triggers a second HITL step asking for the code.
 
     Returns:
-        dict: `{"session_token": "<masked>", "expires_at": …, "username": …}`.
-
-    Raises:
-        TickProxyError: When the form is rejected or TickTick refuses the login.
+        tuple[dict, Status, bool, str]: A tuple containing the session token metadata dict,
+        the HITL response status, a boolean indicating whether the payload was edited,
+        and the HITL reviewer comment.
 
     Examples:
-        >>> session_refresh()
-        {'session_token': 'a1b2…e8f90', 'obtained_at': '2026-08-09T11:24:03Z', 'expires_at': '2026-09-08T11:24:03Z'}
-        >>> session_refresh()
-        {'session_token': 'c3d4…a1b2c', 'obtained_at': '2026-08-09T12:00:00Z', 'expires_at': '2026-09-08T12:00:00Z'}
+        >>> session_refresh()[0]['session_token'][:4]
+        'a1b2'
     """
     load_env()
-    form = {"username": get_username(), "password": ""}
+    form = {"username": get_email(), "password": ""}
     response = request_approval("admin session-refresh", form)
     if response.status == "rejected":
-        raise TickProxyError(
-            f"Session refresh rejected: {response.comment or 'no reason given'}"
-        )
+        return None, "rejected", response.edited, response.comment
+    edited = response.edited
+    comment = response.comment
+    status = response.status
     values = response.payload if isinstance(response.payload, dict) else form
     username = str(values.get("username") or "").strip()
     password = str(values.get("password") or "")
@@ -225,24 +312,47 @@ def session_refresh() -> dict:
     token = data.get("token")
 
     if not token and data.get("authId"):
-        code_form = {"authId": data["authId"], "code": ""}
+        expire_time = data.get("expireTime")
+        if isinstance(expire_time, (int, float)) and expire_time > 3600:
+            data, device_comment = _complete_device_approval(username, password)
+            if data is None:
+                return None, "rejected", edited, device_comment
+            token = data.get("token")
+
+    if not token and data.get("authId"):
+        auth_id = str(data["authId"])
+        code_form = {"code": ""}
         code_response = request_approval("admin session-refresh (2FA code)", code_form)
         if code_response.status == "rejected":
-            raise TickProxyError("2FA verification rejected.")
+            return (
+                None,
+                "rejected",
+                edited or code_response.edited,
+                code_response.comment,
+            )
+        edited = edited or code_response.edited
+        if code_response.comment:
+            comment = (
+                f"{comment} | 2FA: {code_response.comment}"
+                if comment
+                else code_response.comment
+            )
+        status = code_response.status
         code_values = (
             code_response.payload if isinstance(code_response.payload, dict) else {}
         )
         with httpx.Client(timeout=api_timeout()) as c:
             r = c.post(
                 f"{v2_base_url()}{V2_MFA_VERIFY_PATH}",
+                params=SIGNON_PARAMS,
                 json={
-                    "authId": data["authId"],
                     "code": str(code_values.get("code") or "").strip(),
+                    "method": "app",
                 },
-                headers={"Content-Type": "application/json", "User-Agent": USER_AGENT},
+                headers={**v2_login_headers(), "x-verify-id": auth_id},
             )
         if r.status_code != 200:
-            raise TickProxyError(f"2FA verification failed: {r.text[:200]}")
+            raise _login_error(r, "2FA verification")
         token = r.json().get("token")
 
     del password  # the password never outlives this call
@@ -257,14 +367,91 @@ def session_refresh() -> dict:
     values_to_write = {
         ENV_API_TOKEN: get_api_token(),
         ENV_SESSION_TOKEN: str(token),
-        ENV_USERNAME: username,
+        ENV_EMAIL: username,
         ENV_TOKEN_OBTAINED_AT: now.strftime("%Y-%m-%dT%H:%M:%SZ"),
         ENV_TOKEN_EXPIRES_AT: expires.strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
     write_env(values_to_write)
-    return {
-        "session_token": _mask(str(token)),
-        "obtained_at": values_to_write[ENV_TOKEN_OBTAINED_AT],
-        "expires_at": values_to_write[ENV_TOKEN_EXPIRES_AT],
-        "username": username,
+    return (
+        {
+            "session_token": _mask(str(token)),
+            "obtained_at": values_to_write[ENV_TOKEN_OBTAINED_AT],
+            "expires_at": values_to_write[ENV_TOKEN_EXPIRES_AT],
+            "username": username,
+        },
+        cast(Status, status),
+        edited,
+        comment,
+    )
+
+
+def reset() -> AdminResult:
+    """Clear all credentials from the configuration file, leaving only headers.
+
+    Returns:
+        tuple[dict, Status, bool, str]: A tuple containing the reset status dict,
+        the HITL response status, a boolean indicating whether it was edited,
+        and the HITL reviewer comment.
+
+    """
+    form = {
+        "action": "clear_credentials",
+        "config_file": str(ENV_PATH),
+        "confirm": "Yes, clear all credentials",
     }
+    response = request_approval("admin reset", form)
+    if response.status == "rejected":
+        return None, "rejected", response.edited, response.comment
+
+    write_env({})
+    return (
+        {"status": "cleared", "config": str(ENV_PATH)},
+        cast(Status, response.status),
+        response.edited,
+        response.comment,
+    )
+
+
+def purge() -> AdminResult:
+    """Delete the configuration directory and uninstall the CLI tool.
+
+    Returns:
+        tuple[dict, Status, bool, str]: A tuple containing the purge status dict,
+        the HITL response status, a boolean indicating whether it was edited,
+        and the HITL reviewer comment.
+
+    """
+    form = {
+        "action": "delete_config_and_uninstall",
+        "config_dir": str(CONFIG_DIR),
+        "uninstalled_tool": "tick-proxy",
+        "confirm": "Yes, delete config and uninstall the CLI",
+    }
+    response = request_approval("admin purge", form)
+    if response.status == "rejected":
+        return None, "rejected", response.edited, response.comment
+
+    import shutil
+
+    config_dir_deleted = False
+    if CONFIG_DIR.exists():
+        shutil.rmtree(CONFIG_DIR)
+        config_dir_deleted = True
+
+    # Intelligent purge: we do NOT uninstall the tool from within this running
+    # process — that would wipe this package's own site-packages mid-execution
+    # (rich, typer, ...) and crash before the envelope can be printed. The config
+    # is removed here; the operator finishes the uninstall explicitly with:
+    #   uv tool uninstall tick-proxy
+    return (
+        {
+            "status": "purged",
+            "config_dir": str(CONFIG_DIR),
+            "config_dir_deleted": config_dir_deleted,
+            "uninstalled": False,
+            "note": "Config removed. To fully uninstall the CLI, run: uv tool uninstall tick-proxy",
+        },
+        cast(Status, response.status),
+        response.edited,
+        response.comment,
+    )

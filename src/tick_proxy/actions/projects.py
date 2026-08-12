@@ -5,8 +5,17 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 from ..client import TickClient
+from ..exceptions import TickProxyError
 from ..models import Verification
-from .base import ActionDef, always_verify, compare
+from .base import (
+    ActionDef,
+    action_def,
+    compare,
+    require_approval,
+    require_preflight,
+    require_verification,
+    verify_absence,
+)
 
 # V2 wants the literal string "NONE" to clear a folder — JSON null is ignored.
 NO_FOLDER = "NONE"
@@ -40,6 +49,24 @@ class ProjectIdPayload(BaseModel):
     project_id: str = Field(..., description="Project id")
 
 
+def _require_project(client: TickClient, project_id: str) -> None:
+    """Ensure a project exists before an irreversible approval can be shown.
+
+    Args:
+        client (TickClient): Authenticated V1 client used for the project read.
+        project_id (str): Project identifier that must exist.
+
+    Returns:
+        None: Returns normally when TickTick returns the project.
+
+    Examples:
+        >>> _require_project(type("C", (), {"v1_get": lambda *_: {"id": "p1"}})(), "p1")
+        >>> bool("project_id")
+        True
+    """
+    client.v1_get(f"/project/{project_id}")
+
+
 def project_info(client: TickClient, p: ProjectIdPayload) -> dict:
     """Full detail of one project.
 
@@ -65,7 +92,7 @@ class ProjectCreatePayload(BaseModel):
     group_id: str | None = Field(None, description="Folder id (from folder-list)")
 
 
-@always_verify("groupId")
+@require_verification("groupId")
 def project_create(
     client: TickClient, p: ProjectCreatePayload
 ) -> tuple[dict, Verification]:
@@ -127,7 +154,7 @@ class ProjectUpdatePayload(BaseModel):
     closed: bool | None = Field(None, description="True archives the project")
 
 
-@always_verify("groupId")
+@require_verification("groupId")
 def project_update(
     client: TickClient, p: ProjectUpdatePayload
 ) -> tuple[dict, Verification]:
@@ -191,8 +218,16 @@ def project_update(
     return {**updated, "groupId": actual_group}, verification
 
 
-def project_delete(client: TickClient, p: ProjectIdPayload) -> dict:
-    """Delete a project AND all its tasks. IRREVERSIBLE — HITL required.
+@require_approval()
+@require_verification("deleted")
+@require_preflight(
+    check=lambda client, payload: _require_project(client, payload.project_id),
+    identity_fields=("project_id",),
+)
+def project_delete(
+    client: TickClient, p: ProjectIdPayload
+) -> tuple[dict, Verification]:
+    """Delete a project once through V2, poll its absence, and reject absent ids.
 
     Parameters:
         - project_id (str): The project to delete.
@@ -204,9 +239,20 @@ def project_delete(client: TickClient, p: ProjectIdPayload) -> dict:
         - Delete a scratch project:
             `tick-proxy do project-delete '{"project_id":"6www"}'`
             → {"deleted":"6www"}
+        - Retry the same deleted project:
+            `tick-proxy do project-delete '{"project_id":"6www"}'`
+            → exit 1 before HITL: `[404] Not found — check the ids in your payload.`
+        - Observe eventual consistency safely:
+            `tick-proxy do project-delete '{"project_id":"6test"}'`
+            → one V2 batch delete, then bounded GET polling until `data.verification.ok=true`.
     """
-    client.v1_delete(f"/project/{p.project_id}")
-    return {"deleted": p.project_id}
+    client.v2_post("/batch/project", {"delete": [p.project_id]})
+    verification = verify_absence(
+        lambda: client.v1_get(f"/project/{p.project_id}"),
+        p.project_id,
+        f"GET /open/v1/project/{p.project_id}",
+    )
+    return {"deleted": p.project_id}, verification
 
 
 # ── folders (project groups) ─────────────────────────────────────────────────
@@ -235,13 +281,46 @@ class FolderManagePayload(BaseModel):
     delete: list[str] | None = Field(None, description='["folderId", …]')
 
 
+def _require_deleted_folders(client: TickClient, folder_ids: list[str] | None) -> None:
+    """Ensure every requested folder deletion target exists before HITL.
+
+    Args:
+        client (TickClient): Authenticated client used for the authoritative V2 sync.
+        folder_ids (list[str] | None): Folder identifiers requested for deletion.
+
+    Returns:
+        None: Returns normally when all requested folders exist or no deletion is requested.
+
+    Raises:
+        TickProxyError: When any folder scheduled for deletion is absent.
+
+    Examples:
+        >>> _require_deleted_folders(type("C", (), {"full_sync": lambda _: {"projectGroups": [{"id": "f1"}]}})(), ["f1"])
+        >>> _require_deleted_folders(type("C", (), {"full_sync": lambda _: {"projectGroups": []}})(), None)
+    """
+    if not folder_ids:
+        return
+    existing = {
+        str(folder.get("id"))
+        for folder in client.full_sync().get("projectGroups") or []
+    }
+    missing = sorted(set(folder_ids) - existing)
+    if missing:
+        raise TickProxyError(f"Folder not found: {', '.join(missing)}.")
+
+
+@require_approval()
+@require_preflight(
+    check=lambda client, payload: _require_deleted_folders(client, payload.delete),
+    identity_fields=("delete",),
+)
 def folder_manage(client: TickClient, p: FolderManagePayload) -> dict:
-    """Create / rename / delete folders in one batch. HITL when `delete` is present.
+    """Create, rename, or delete folders in one mandatory full-JSON HITL review.
 
     Parameters:
         - add (list[dict]|null): `[{"name": "Work"}]`.
         - update (list[dict]|null): `[{"id": "5aaa", "name": "New name"}]`.
-        - delete (list[str]|null): `["5aaa"]` — triggers the HITL review.
+        - delete (list[str]|null): `["5aaa"]`.
 
     Examples:
         - Create a folder:
@@ -288,8 +367,41 @@ class ColumnManagePayload(BaseModel):
     delete: list[str] | None = Field(None, description='["c1", …]')
 
 
+def _require_deleted_columns(client: TickClient, payload: BaseModel) -> None:
+    """Ensure a column mutation targets an existing project and requested columns.
+
+    Args:
+        client (TickClient): Authenticated V1 client used for the project data read.
+        payload (BaseModel): Column mutation request to validate.
+
+    Returns:
+        None: Returns normally when the project and every deleted column exist.
+
+    Raises:
+        TickProxyError: When a requested deletion identifies no column in the project.
+
+    Examples:
+        >>> client = type("C", (), {"v1_get": lambda *_: {"columns": [{"id": "c1"}]}})()
+        >>> _require_deleted_columns(client, ColumnManagePayload(project_id="p1", delete=["c1"]))
+        >>> _require_deleted_columns(client, ColumnManagePayload(project_id="p1"))
+    """
+    columns_payload = ColumnManagePayload.model_validate(payload.model_dump())
+    data = client.v1_get(f"/project/{columns_payload.project_id}/data")
+    existing = {str(column.get("id")) for column in data.get("columns") or []}
+    missing = sorted(set(columns_payload.delete or []) - existing)
+    if missing:
+        raise TickProxyError(
+            f"Column not found in project {columns_payload.project_id}: {', '.join(missing)}."
+        )
+
+
+@require_approval()
+@require_preflight(
+    check=lambda client, payload: _require_deleted_columns(client, payload),
+    identity_fields=("project_id", "delete"),
+)
 def column_manage(client: TickClient, p: ColumnManagePayload) -> dict:
-    """Create / rename / delete kanban columns. HITL when `delete` is present.
+    """Create, rename, or delete kanban columns in one mandatory full-JSON HITL review.
 
     ⚠️ `projectId` must travel with every entry — without it the V2 endpoint
     answers 200 with an empty `id2etag` and silently drops the update.
@@ -298,7 +410,7 @@ def column_manage(client: TickClient, p: ColumnManagePayload) -> dict:
         - project_id (str): The project owning the columns.
         - add (list[dict]|null): `[{"name": "To Do", "sortOrder": 0}]`.
         - update (list[dict]|null): `[{"id": "c1", "name": "Done"}]`.
-        - delete (list[str]|null): `["c1"]` — triggers the HITL review.
+        - delete (list[str]|null): `["c1"]`.
 
     Examples:
         - Create two columns:
@@ -325,25 +437,23 @@ ACTIONS = [
         "project-create",
         ProjectCreatePayload,
         project_create,
-        verify="always",
         group="Projects",
     ),
     ActionDef(
         "project-update",
         ProjectUpdatePayload,
         project_update,
-        verify="always",
         group="Projects",
     ),
-    ActionDef(
-        "project-delete", ProjectIdPayload, project_delete, hitl=True, group="Projects"
+    action_def(
+        "project-delete", ProjectIdPayload, project_delete, v2=True, group="Projects"
     ),
     ActionDef("folder-list", EmptyPayload, folder_list, v2=True, group="Folders"),
-    ActionDef(
+    action_def(
         "folder-manage", FolderManagePayload, folder_manage, v2=True, group="Folders"
     ),
     ActionDef("column-list", ProjectIdPayload, column_list, group="Columns"),
-    ActionDef(
+    action_def(
         "column-manage", ColumnManagePayload, column_manage, v2=True, group="Columns"
     ),
 ]

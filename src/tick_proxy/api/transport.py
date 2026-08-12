@@ -15,15 +15,13 @@ from ..config import (
     ENV_API_TOKEN,
     ENV_SESSION_TOKEN,
     SESSION_COOKIE_NAME,
-    USER_AGENT,
-    V2_DEVICE_HEADER,
     api_timeout,
     get_api_token,
     get_session_token,
     has_v2_auth,
     v1_base_url,
     v2_base_url,
-    web_origin,
+    v2_login_headers,
 )
 from ..exceptions import TickTickAPIError
 
@@ -34,7 +32,7 @@ class Transport:
     """Thin HTTP wrapper around the two TickTick APIs.
 
     One instance per CLI invocation; it owns a single `httpx.Client` so that
-    connection reuse works across the read-back performed by `@always_verify`.
+    connection reuse works across the read-back performed by `@require_verification`.
 
     Examples:
         >>> Transport().v1("get", "/project")[0]["name"]
@@ -93,11 +91,7 @@ class Transport:
         """
         return {
             "Cookie": f"{SESSION_COOKIE_NAME}={get_session_token()}",
-            "Content-Type": "application/json",
-            "User-Agent": USER_AGENT,
-            "X-Device": V2_DEVICE_HEADER,
-            "Origin": web_origin(),
-            "Referer": f"{web_origin()}/",
+            **v2_login_headers(),
         }
 
     # ── error translation ────────────────────────────────────────────────────

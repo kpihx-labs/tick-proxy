@@ -15,7 +15,7 @@ Binding to port 0 lets the kernel hand out a guaranteed-free port instead.
 
 import json
 import logging
-import socket
+import sys
 import threading
 import uuid
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -24,26 +24,12 @@ from typing import Any, ClassVar
 
 logger = logging.getLogger(__name__)
 
-HITL_TIMEOUT: int | None = 300  # seconds (None = wait forever)
+HITL_TIMEOUT: int | None = 600  # seconds (None = wait forever)
 
-TEMPLATE_PATH = Path(__file__).parent / "templates" / "hitl.html"
-
-
-def _find_free_port() -> int:
-    """Bind to port 0 to get a guaranteed-free port from the OS.
-
-    Returns:
-        int: An available TCP port on the loopback interface.
-
-    Examples:
-        >>> 1024 < _find_free_port() < 65536
-        True
-        >>> _find_free_port() != _find_free_port()   # almost always distinct
-        True
-    """
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("", 0))
-        return int(s.getsockname()[1])
+TEMPLATES_DIR = Path(__file__).parent / "templates"
+TEMPLATE_PATH = TEMPLATES_DIR / "hitl.html"
+TASK_TEMPLATE_PATH = TEMPLATES_DIR / "task.html"
+STYLESHEET_PATH = TEMPLATES_DIR / "hitl.css"
 
 
 class HITLResponse:
@@ -107,6 +93,12 @@ class HITLServer(BaseHTTPRequestHandler):
             >>> # GET /review?id=<known>  → 200 with the HTML form
             >>> # GET /review?id=<unknown> → 404
         """
+        if self.path == "/assets/hitl.css":
+            self.send_response(200)
+            self.send_header("Content-type", "text/css; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(STYLESHEET_PATH.read_bytes())
+            return
         if self.path.startswith("/review"):
             query = self.path.split("?")[-1]
             req_id = query.split("id=")[-1] if "id=" in query else ""
@@ -149,6 +141,9 @@ class HITLServer(BaseHTTPRequestHandler):
                 payload = payload_raw
         else:
             payload = payload_raw if payload_raw is not None else req.get("payload")
+        if req.get("task_context") is not None and not isinstance(payload, dict):
+            self.send_error(400, "A task review must submit a JSON object.")
+            return
         req["result"] = HITLResponse(
             post.get("status", "rejected"),
             payload,
@@ -187,22 +182,37 @@ class HITLServer(BaseHTTPRequestHandler):
             payload_display = safe
             payload_safe = safe[:100]
         try:
-            html = TEMPLATE_PATH.read_text()
+            template_path = (
+                TASK_TEMPLATE_PATH
+                if req.get("task_context") is not None
+                else TEMPLATE_PATH
+            )
+            html = template_path.read_text()
         except FileNotFoundError:
-            return f"<html><body><h2>Template not found: {TEMPLATE_PATH}</h2></body></html>"
+            return f"<html><body><h2>Template not found: {template_path}</h2></body></html>"
         html = html.replace("{{FUNC_NAME}}", req.get("func_name", "unknown"))
         html = html.replace("{{PAYLOAD_JSON}}", payload_display)
         html = html.replace("{{PAYLOAD_JSON_SAFE}}", payload_safe)
         html = html.replace("{{REQUEST_ID}}", req_id)
+        task_context = req.get("task_context")
+        if task_context is not None:
+            context_safe = json.dumps(
+                {**task_context, "id": req_id}, default=str
+            ).replace("</", "<\\/")
+            html = html.replace("{{TASK_CONTEXT_JSON}}", context_safe)
         return html
 
 
-def request_approval(action: str, payload: Any) -> HITLResponse:
+def request_approval(
+    action: str, payload: Any, task_context: dict[str, Any] | None = None
+) -> HITLResponse:
     """Open the HITL web form and block until the reviewer decides.
 
     Args:
         action (str): Action name shown in the form, e.g. `task-delete`.
         payload (Any): The payload submitted for review (JSON-serialisable).
+        task_context (dict[str, Any] | None): When present, selects the unified
+            task-document review and supplies its original/proposed fields.
 
     Returns:
         HITLResponse: The decision, including the (possibly edited) payload.
@@ -219,20 +229,30 @@ def request_approval(action: str, payload: Any) -> HITLResponse:
     req_context: dict[str, Any] = {
         "func_name": action,
         "payload": payload,
+        "task_context": task_context,
         "event": event,
         "result": None,
     }
     HITLServer.active_requests[req_id] = req_context
 
-    port = _find_free_port()
-    server = HTTPServer(("127.0.0.1", port), HITLServer)
+    server = HTTPServer(("127.0.0.1", 0), HITLServer)
+    port = int(server.server_address[1])
     url = f"http://127.0.0.1:{port}/review?id={req_id}"
 
-    print("\n🚀 [HITL] ACTION REVIEW REQUIRED")
-    print(f"🔗 {url}")
-    print(f"📝 Action: {action}")
-    print("If the browser doesn't open, connect from a machine with a GUI:")
-    print(f"   ssh -L {port}:localhost:{port} your-host")
+    print("\n🚀 [HITL] ACTION REVIEW REQUIRED", file=sys.stderr)
+    print(f"🔗 {url}", file=sys.stderr)
+    print(f"📝 Action: {action}", file=sys.stderr)
+    print(
+        "If the browser doesn't open, connect from a machine with a GUI:",
+        file=sys.stderr,
+    )
+    print(f"   ssh -L {port}:localhost:{port} your-host", file=sys.stderr)
+
+    def serve() -> None:
+        while not event.is_set():
+            server.handle_request()
+
+    threading.Thread(target=serve, daemon=True).start()
 
     import webbrowser
 
@@ -240,12 +260,6 @@ def request_approval(action: str, payload: Any) -> HITLResponse:
         webbrowser.open(url)
     except OSError:  # pragma: no cover - headless host
         logger.warning("Failed to open browser for HITL URL: %s", url)
-
-    def serve() -> None:
-        while not event.is_set():
-            server.handle_request()
-
-    threading.Thread(target=serve, daemon=True).start()
 
     if not event.wait(timeout=HITL_TIMEOUT):
         logger.warning("HITL timeout expired for %s (id=%s)", action, req_id)

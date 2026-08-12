@@ -6,7 +6,7 @@ Single source of truth: ~/.config/tick-proxy/.env — no config.yaml, no in-repo
 one of them is overridable from that same .env file.
 
 Password policy (KπX directive): the TickTick password is NEVER stored. The
-.env holds at most TICK_API_TOKEN, TICK_SESSION_TOKEN and TICK_USERNAME.
+.env holds at most TICK_API_TOKEN, TICK_SESSION_TOKEN and TICK_EMAIL.
 """
 
 import os
@@ -20,9 +20,13 @@ ENV_PATH = CONFIG_DIR / ".env"
 # ── Environment variable names (single source of truth) ───────────────────────
 ENV_API_TOKEN = "TICK_API_TOKEN"
 ENV_SESSION_TOKEN = "TICK_SESSION_TOKEN"
-ENV_USERNAME = "TICK_USERNAME"
+ENV_EMAIL = "TICK_EMAIL"
 ENV_TOKEN_OBTAINED_AT = "TICK_SESSION_TOKEN_OBTAINED_AT"
 ENV_TOKEN_EXPIRES_AT = "TICK_SESSION_TOKEN_EXPIRES_AT"
+
+# ── Permissions (single source of truth) ──────────────────────────────────────
+DIR_PERMISSIONS = 0o700
+FILE_PERMISSIONS = 0o600
 
 # ── Endpoint defaults (documented constants, all overridable via .env) ─────────
 DEFAULT_V1_BASE_URL = "https://api.ticktick.com/open/v1"
@@ -42,6 +46,22 @@ V2_DEVICE_HEADER = (
 )
 
 
+def v2_login_headers() -> dict[str, str]:
+    """Build canonical browser headers for unauthenticated V2 login exchanges.
+
+    The sign-on and MFA endpoints both validate the browser fingerprint. Keeping
+    this construction here prevents either flow from drifting from the other.
+    """
+    origin = web_origin()
+    return {
+        "Content-Type": "application/json",
+        "User-Agent": USER_AGENT,
+        "X-Device": V2_DEVICE_HEADER,
+        "Origin": origin,
+        "Referer": f"{origin}/",
+    }
+
+
 def load_env() -> dict[str, str]:
     """Load the .env file into os.environ and return it as a dict.
 
@@ -54,7 +74,7 @@ def load_env() -> dict[str, str]:
 
     Examples:
         >>> load_env()
-        {'TICK_API_TOKEN': '6f8a…a7b', 'TICK_USERNAME': 'kapoivha@gmail.com'}
+        {'TICK_API_TOKEN': '6f8a…a7b', 'TICK_EMAIL': 'user@example.com'}
         >>> load_env()          # when ~/.config/tick-proxy/.env is absent
         {}
     """
@@ -82,7 +102,7 @@ def write_env(values: dict[str, str]) -> None:
 
     Args:
         values (dict[str, str]): Full desired content, e.g.
-            ``{"TICK_API_TOKEN": "6f8a…", "TICK_USERNAME": "me@example.com"}``.
+            ``{"TICK_API_TOKEN": "6f8a…", "TICK_EMAIL": "me@example.com"}``.
 
     Returns:
         None: Writes the file and sets 0600 permissions.
@@ -99,8 +119,8 @@ def write_env(values: dict[str, str]) -> None:
     ]
     lines.extend(f"{k}={v}" for k, v in values.items() if v)
     ENV_PATH.write_text("\n".join(lines) + "\n")
-    ENV_PATH.chmod(0o600)
-    CONFIG_DIR.chmod(0o700)
+    ENV_PATH.chmod(FILE_PERMISSIONS)
+    CONFIG_DIR.chmod(DIR_PERMISSIONS)
 
 
 def ensure_env(require_v2: bool = False) -> None:
@@ -134,7 +154,7 @@ def ensure_env(require_v2: bool = False) -> None:
     if require_v2 and not has_v2_auth():
         raise TickProxyError(
             "This action requires V2 access. Provide "
-            f"{ENV_SESSION_TOKEN} (or {ENV_USERNAME} then run "
+            f"{ENV_SESSION_TOKEN} (or {ENV_EMAIL} then run "
             "'tick-proxy admin session-refresh')."
         )
 
@@ -169,19 +189,19 @@ def get_session_token() -> str:
     return os.environ.get(ENV_SESSION_TOKEN, "")
 
 
-def get_username() -> str:
+def get_email() -> str:
     """Return the stored TickTick account e-mail (used only to pre-fill HITL).
 
     Returns:
         str: The e-mail, or an empty string when unset.
 
     Examples:
-        >>> get_username()
-        'kapoivha@gmail.com'
-        >>> get_username()      # unset
+        >>> get_email()
+        'user@example.com'
+        >>> get_email()      # unset
         ''
     """
-    return os.environ.get(ENV_USERNAME, "")
+    return os.environ.get(ENV_EMAIL, "")
 
 
 def has_v2_auth() -> bool:
@@ -194,7 +214,7 @@ def has_v2_auth() -> bool:
     Examples:
         >>> has_v2_auth()      # session token set
         True
-        >>> has_v2_auth()      # only TICK_USERNAME set
+        >>> has_v2_auth()      # only TICK_EMAIL set
         False
     """
     return bool(get_session_token())

@@ -73,7 +73,9 @@ def test_filter_by_tags_any_and_all():
 
 
 def test_filter_by_due_window():
-    got = filter_tasks(TASKS, {"due_from": "2026-08-09", "due_to": "2026-08-09T23:59:59"})
+    got = filter_tasks(
+        TASKS, {"due_from": "2026-08-09", "due_to": "2026-08-09T23:59:59"}
+    )
     assert [t["id"] for t in got] == ["1"]
 
 
@@ -89,6 +91,9 @@ def test_filter_limit_and_sort():
 
 
 def test_resolve_project_ids_by_name():
-    projects = [{"id": "6xxx", "name": "🛠️ Tech & Science"}, {"id": "6yyy", "name": "Books"}]
+    projects = [
+        {"id": "6xxx", "name": "🛠️ Tech & Science"},
+        {"id": "6yyy", "name": "Books"},
+    ]
     assert resolve_project_ids({"project_names": ["tech"]}, projects) == ["6xxx"]
     assert resolve_project_ids({}, projects) == []

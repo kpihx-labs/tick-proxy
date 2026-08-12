@@ -3,15 +3,25 @@
 from tick_proxy.actions.registry import REGISTRY, by_group
 
 EXPECTED_ACTIONS = 52
-ALWAYS_VERIFY = {
+REQUIRE_VERIFICATION = {
+    "project-delete",
+    "task-create",
+    "task-update",
+    "subtask-create",
     "task-move",
     "task-parent-set",
-    "subtask-create",
     "project-create",
     "project-update",
     "habit-update",
 }
 HITL = {
+    "column-manage",
+    "folder-manage",
+    "task-create",
+    "task-update",
+    "subtask-create",
+    "task-batch-create",
+    "task-batch-update",
     "task-delete",
     "task-batch-delete",
     "project-delete",
@@ -44,18 +54,69 @@ def test_every_action_has_a_docstring_with_examples():
         assert "Examples:" in doc, f"{name} docstring lacks Examples:"
 
 
-def test_always_verify_actions_carry_the_decorator():
-    declared = {n for n, a in REGISTRY.items() if a.verify == "always"}
-    assert declared == ALWAYS_VERIFY
+def test_required_verifications_carry_the_decorator():
+    declared = {
+        name
+        for name, action in REGISTRY.items()
+        if getattr(action.handler, "__require_verification__", False)
+    }
+    assert declared == REQUIRE_VERIFICATION
     for name in declared:
         handler = REGISTRY[name].handler
-        assert getattr(handler, "__always_verify__", False), (
-            f"{name} declares verify='always' but lacks @always_verify"
+        assert getattr(handler, "__verification_checks__", ()), (
+            f"{name} requires verification but declares no compared fields"
         )
 
 
-def test_hitl_actions_are_the_destructive_ones():
+def test_hitl_actions_match_the_explicit_review_policy():
     assert {n for n, a in REGISTRY.items() if a.hitl} == HITL
+    for name in HITL:
+        assert getattr(REGISTRY[name].handler, "__require_approval__", False), (
+            f"{name} is HITL but does not declare @require_approval"
+        )
+
+
+def test_all_irreversible_actions_declare_preflight_and_locked_target():
+    """Ensure every destructive review validates and locks its target first.
+
+    Returns:
+        None: Every irreversible handler exposes its guard and target fields.
+
+    Examples:
+        >>> bool(("project_id",))
+        True
+        >>> callable(lambda: None)
+        True
+    """
+    expected = {
+        "project-delete": ("project_id",),
+        "task-delete": ("project_id", "task_id"),
+        "task-batch-delete": ("tasks",),
+        "tag-delete": ("name",),
+        "tag-merge": ("source", "target"),
+        "habit-delete": ("habit_id",),
+        "folder-manage": ("delete",),
+        "column-manage": ("project_id", "delete"),
+    }
+    for name, identity_fields in expected.items():
+        handler = REGISTRY[name].handler
+        assert callable(getattr(handler, "__preflight_check__", None)), name
+        assert getattr(handler, "__preflight_identity_fields__", ()) == identity_fields
+
+
+def test_only_task_writes_declare_three_document_reviews():
+    reviewed = {
+        name
+        for name, action in REGISTRY.items()
+        if getattr(action.handler, "__require_reviews__", False)
+    }
+    assert reviewed == {"task-create", "task-update", "subtask-create"}
+    for name in reviewed:
+        assert getattr(REGISTRY[name].handler, "__review_fields__", ()) == (
+            "title",
+            "content",
+            "desc",
+        )
 
 
 def test_groups_cover_every_action():

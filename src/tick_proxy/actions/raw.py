@@ -5,7 +5,7 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 from ..client import TickClient
-from .base import ActionDef
+from .base import action_def, require_approval
 
 
 class RawPayload(BaseModel):
@@ -18,6 +18,7 @@ class RawPayload(BaseModel):
     payload: dict[str, Any] | list[Any] | None = Field(None, description="JSON body")
 
 
+@require_approval()
 def raw(client: TickClient, p: RawPayload) -> Any:
     """Call ANY TickTick endpoint directly — 100 % API coverage. HITL required.
 
@@ -44,6 +45,4 @@ def raw(client: TickClient, p: RawPayload) -> Any:
     return call(p.method, p.endpoint, params=p.params, payload=p.payload)  # type: ignore[arg-type]
 
 
-ACTIONS = [
-    ActionDef("raw", RawPayload, raw, hitl=True, group="Escape hatch"),
-]
+ACTIONS = [action_def("raw", RawPayload, raw, group="Escape hatch")]
