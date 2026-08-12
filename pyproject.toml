@@ -1,6 +1,6 @@
 [project]
 name = "tick-proxy"
-version = "2.1.0"
+version = "2.1.1"
 description = "TickTick administrative proxy — RPC CLI for tasks, projects, habits, tags and query views"
 requires-python = ">=3.12"
 dependencies = [

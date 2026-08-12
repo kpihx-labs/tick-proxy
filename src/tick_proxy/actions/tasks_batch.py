@@ -27,20 +27,32 @@ class BatchCreatePayload(BaseModel):
 def task_batch_create(client: TickClient, p: BatchCreatePayload) -> dict:
     """Create several tasks in one V2 batch call after one full-JSON HITL review.
 
-    ⚠️ `parentId` is silently ignored here — link children afterwards with
-    `task-parent-set` (which verifies the link).
+    This command is ideal for bulk insertions of tasks (e.g. bootstrapping a list
+    of actions). It preserves the V2 batch format without document diffs. If you
+    need precise document editing reviews, run individual `task-create` actions instead.
 
     Parameters:
-        - tasks (list[dict]): Each entry needs `title`; optional `projectId`,
-          `content`, `priority`, `dueDate`, `timeZone`, `tags`, `isAllDay`.
+        - tasks (list[dict]): Each task dictionary can contain:
+          - title (str, required): Task title.
+          - projectId (str, optional): Target project ID (defaults to Inbox).
+          - content (str, optional): Description body.
+          - priority (int, optional): 0=none, 1=low, 3=medium, 5=high.
+          - dueDate (str, optional): ISO date string.
+          - tags (list[str], optional): Array of tag strings.
+          - columnId (str, optional): Kanban column ID.
 
     Examples:
-        - Create two tasks at once:
-            `tick-proxy do task-batch-create '{"tasks":[{"title":"A","projectId":"6xxx"},{"title":"B","projectId":"6xxx"}]}'`
-            → {"id2etag":{"68f1":"abc","68f2":"def"},"id2error":{}}
-        - Create one task in the Inbox:
-            `tick-proxy do task-batch-create '{"tasks":[{"title":"Call back"}]}'`
-            → {"id2etag":{"68f3":"ghi"},"id2error":{}}
+        - Create two simple tasks in one batch call:
+            `tick-proxy do task-batch-create '{"tasks":[{"title":"Task 1","priority":1},{"title":"Task 2","projectId":"6xxx","priority":3}]}'`
+            → {"id2etag":{"6task1":"etag1","6task2":"etag2"},"id2error":{}}
+
+        - Create a list of tagged tasks inside a specific project:
+            `tick-proxy do task-batch-create '{"tasks":[{"title":"Boot system","projectId":"6xxx","tags":["homelab"]},{"title":"Verify logs","projectId":"6xxx","tags":["homelab","verify"]}]}'`
+            → {"id2etag":{"6task1":"etag1","6task2":"etag2"},"id2error":{}}
+
+    Note:
+        `parentId` is silently ignored by TickTick during batch creation.
+        Always follow up with `task-parent-set` if you need to build subtask structures.
     """
     return client.v2_post("/batch/task", {"add": p.tasks})
 
@@ -53,20 +65,37 @@ class BatchUpdatePayload(BaseModel):
 def task_batch_update(client: TickClient, p: BatchUpdatePayload) -> dict:
     """Update several tasks in one V2 batch call after one full-JSON HITL review.
 
-    ⚠️ This endpoint cannot set reminders reliably — use `task-update` (V1) with
-    an explicit `due_date` anchor for anything reminder-related.
+    This command is ideal for bulk metadata updates (e.g. shifting projects, adding
+    tags, or changing priorities in bulk). It uses V2 batch format without document
+    diffs. If you need precise document editing reviews, run individual `task-update`
+    actions instead.
 
     Parameters:
-        - tasks (list[dict]): Each entry MUST carry `id` and `projectId`, plus
-          the fields to change (no read-modify-write: give full values).
+        - tasks (list[dict]): Each task dictionary MUST contain:
+          - id (str, required): The ID of the task to update.
+          - projectId (str, required): The project ID containing the task.
+          And any fields to update, such as:
+          - title (str, optional): New title.
+          - content (str, optional): New description.
+          - priority (int, optional): New priority.
+          - dueDate (str, optional): New due date (ISO string).
+          - tags (list[str], optional): New tags array.
+          - status (int, optional): 0=active, 2=completed, -1=abandoned.
+          - columnId (str, optional): Move to a kanban column.
 
     Examples:
-        - Bump two tasks to high priority:
-            `tick-proxy do task-batch-update '{"tasks":[{"id":"68f1","projectId":"6xxx","priority":5},{"id":"68f2","projectId":"6xxx","priority":5}]}'`
-            → {"id2etag":{"68f1":"abc","68f2":"def"},"id2error":{}}
-        - Retitle one task:
-            `tick-proxy do task-batch-update '{"tasks":[{"id":"68f1","projectId":"6xxx","title":"New title"}]}'`
-            → {"id2etag":{"68f1":"xyz"},"id2error":{}}
+        - Complete one task and change the priority of another:
+            `tick-proxy do task-batch-update '{"tasks":[{"id":"6t1","projectId":"6xxx","status":2},{"id":"6t2","projectId":"6xxx","priority":5}]}'`
+            → {"id2etag":{"6t1":"etag1","6t2":"etag2"},"id2error":{}}
+
+        - Shift multiple tasks to a kanban column and append a tag:
+            `tick-proxy do task-batch-update '{"tasks":[{"id":"6t1","projectId":"6xxx","columnId":"col1","tags":["work"]},{"id":"6t2","projectId":"6xxx","columnId":"col1","tags":["work","urgent"]}]}'`
+            → {"id2etag":{"6t1":"etag1","6t2":"etag2"},"id2error":{}}
+
+    Note:
+        V2 batch task update cannot reliably set reminders on existing tasks due to
+        V2 API dueDate anchoring constraints. Always use `task-update` (V1) for
+        setting reminders on individual tasks.
     """
     return client.v2_post("/batch/task", {"update": p.tasks})
 
@@ -243,23 +272,38 @@ def subtask_create(
 ) -> tuple[dict, Verification]:
     """Create a task and link it under a parent — one safe composite, verified.
 
-    This is `task-create` + `task-parent-set` in a single call, because passing
-    `parentId` at creation silently does nothing. The parent link is read back
-    and compared before the command returns.
+    This is `task-create` followed by `task-parent-set` in a single command, because
+    passing `parentId` directly at task creation is silently ignored by TickTick.
+    The relationship is read back and verified before the command returns.
 
     Parameters:
-        - title_ops/content_ops/desc_ops: Same checked document operations as
-          `task-create`; raw title/content/desc values are rejected.
-        - parent_id (str), project_id (str): required.
-        - All other `task-create` fields are accepted (priority, due_date, tags…).
+        - title_ops (list[dict]): Checked operations for title, e.g.
+          `[{"op":"insert","insert_lines":[0],"insert_text":"Task Title"}]`.
+        - content_ops (list[dict]|null): Checked operations for content description.
+        - desc_ops (list[dict]|null): Checked operations for alt description.
+        - parent_id (str): The ID of the parent task that will hold this subtask.
+        - project_id (str): The project ID containing the parent task.
+        - priority (int|null): 0=none, 1=low, 3=medium, 5=high.
+        - due_date (str|null): ISO 8601 string, e.g. "2026-08-12T09:00:00+0000".
+        - start_date (str|null): ISO 8601 string.
+        - time_zone (str|null): IANA time zone name (highly recommended with dates).
+        - tags (list[str]|null): Array of tag names.
+        - reminder_minutes (list[int]|null): Reminders before due date, e.g. `[0, 30]`.
+        - column_id (str|null): Target kanban column ID.
 
     Examples:
-        - Add a subtask under a parent with a title insertion:
-            `tick-proxy do subtask-create '{"title_ops":[{"op":"insert","insert_lines":[0],"insert_text":"Draft outline"}],"parent_id":"68e0","project_id":"6xxx"}'`
-            → {"id":"68f1","title":"Draft outline","parentId":"68e0"}
-        - Add a high-priority subtask with title/content operations and a due date:
-            `tick-proxy do subtask-create '{"title_ops":[{"op":"insert","insert_lines":[0],"insert_text":"Review"}],"content_ops":[{"op":"insert","insert_lines":[0],"insert_text":"Check sources"}],"parent_id":"68e0","project_id":"6xxx","priority":5,"due_date":"2026-08-12T09:00:00+0000"}'`
-            → {"id":"68f2","title":"Review","parentId":"68e0","priority":5}
+        - Add a basic subtask under a parent:
+            `tick-proxy do subtask-create '{"title_ops":[{"op":"insert","insert_lines":[0],"insert_text":"Draft outline"}],"parent_id":"68parent","project_id":"6xxx"}'`
+            → {"id":"68child","title":"Draft outline","parentId":"68parent","verification":{"checked":["content","desc","parentId","title"],"ok":true}}
+
+        - Create a high-priority subtask with title/content operations, due date, and reminders:
+            `tick-proxy do subtask-create '{"title_ops":[{"op":"insert","insert_lines":[0],"insert_text":"Review draft"}],"content_ops":[{"op":"insert","insert_lines":[0],"insert_text":"Check formatting"}],"parent_id":"68parent","project_id":"6xxx","priority":5,"due_date":"2026-08-12T15:00:00+0000","time_zone":"Europe/Paris","reminder_minutes":[0, 1440]}'`
+            → {"id":"68child","title":"Review draft","parentId":"68parent","priority":5,"verification":{"checked":["content","desc","parentId","title"],"ok":true}}
+
+    Note:
+        This command is always HITL-required and utilizes the task-document review layout.
+        The browser review page displays the full editable JSON beside three Monaco-patch editors
+        for title, content, and description.
     """
     task_payload = p.model_dump(exclude={"parent_id"}, exclude_none=True)
     created = task_create(

@@ -318,17 +318,33 @@ def folder_manage(client: TickClient, p: FolderManagePayload) -> dict:
     """Create, rename, or delete folders in one mandatory full-JSON HITL review.
 
     Parameters:
-        - add (list[dict]|null): `[{"name": "Work"}]`.
-        - update (list[dict]|null): `[{"id": "5aaa", "name": "New name"}]`.
-        - delete (list[str]|null): `["5aaa"]`.
+        - add (list[dict]|null): List of new folders to create, e.g. `[{"name": "Work"}]`.
+        - update (list[dict]|null): List of folder updates with id and new name,
+          e.g. `[{"id": "5aaa", "name": "New Name"}]`.
+        - delete (list[str]|null): List of folder IDs to delete, e.g. `["5aaa"]`.
+          Any deletion targets are preflight-checked for existence before HITL.
 
     Examples:
-        - Create a folder:
+        - Create a new project folder:
             `tick-proxy do folder-manage '{"add":[{"name":"Work"}]}'`
             → {"id2etag":{"5bbb":"abc"},"id2error":{}}
-        - Rename a folder:
+
+        - Rename an existing folder:
             `tick-proxy do folder-manage '{"update":[{"id":"5aaa","name":"🎓 X"}]}'`
             → {"id2etag":{"5aaa":"def"},"id2error":{}}
+
+        - Delete an existing empty folder:
+            `tick-proxy do folder-manage '{"delete":["5aaa"]}'`
+            → {"id2etag":{},"id2error":{}}
+
+        - Combine multiple operations (add, update, delete) in one call:
+            `tick-proxy do folder-manage '{"add":[{"name":"Personal"}],"update":[{"id":"5aaa","name":"Careers"}],"delete":["5bbb"]}'`
+            → {"id2etag":{"5ccc":"ghi","5aaa":"jkl"},"id2error":{}}
+
+    Note:
+        This command uses V2 batch project group updates and always requires HITL.
+        If a deletion is specified, a read preflight is triggered and the target IDs
+        are locked; deleting nonexistent folders will fail closed before HITL.
     """
     body: dict[str, Any] = {}
     if p.add:
@@ -408,17 +424,34 @@ def column_manage(client: TickClient, p: ColumnManagePayload) -> dict:
 
     Parameters:
         - project_id (str): The project owning the columns.
-        - add (list[dict]|null): `[{"name": "To Do", "sortOrder": 0}]`.
-        - update (list[dict]|null): `[{"id": "c1", "name": "Done"}]`.
-        - delete (list[str]|null): `["c1"]`.
+        - add (list[dict]|null): List of new columns to add,
+          e.g. `[{"name": "To Do", "sortOrder": 0}]`.
+        - update (list[dict]|null): List of columns to rename or reorder,
+          e.g. `[{"id": "c1", "name": "Done", "sortOrder": 2}]`.
+        - delete (list[str]|null): List of column IDs to remove, e.g. `["c1"]`.
+          Any deletion targets are preflight-checked for existence inside the project before HITL.
 
     Examples:
-        - Create two columns:
+        - Create two columns in a kanban project:
             `tick-proxy do column-manage '{"project_id":"6xxx","add":[{"name":"To Do","sortOrder":0},{"name":"Doing","sortOrder":1}]}'`
             → {"id2etag":{"c1":"abc","c2":"def"},"id2error":{}}
-        - Rename one:
+
+        - Rename a column:
             `tick-proxy do column-manage '{"project_id":"6xxx","update":[{"id":"c1","name":"Backlog"}]}'`
             → {"id2etag":{"c1":"ghi"},"id2error":{}}
+
+        - Delete a column:
+            `tick-proxy do column-manage '{"project_id":"6xxx","delete":["c1"]}'`
+            → {"id2etag":{},"id2error":{}}
+
+        - Run a combination of column updates and additions:
+            `tick-proxy do column-manage '{"project_id":"6xxx","add":[{"name":"QA","sortOrder":2}],"update":[{"id":"c1","name":"Ready"}]}'`
+            → {"id2etag":{"c2":"jkl","c1":"mno"},"id2error":{}}
+
+    Note:
+        This command uses V2 batch column mutations and always requires HITL.
+        If a deletion is specified, a read preflight is triggered to ensure the column
+        actually belongs to the specified project; invalid targets fail closed before HITL.
     """
     body: dict[str, Any] = {}
     if p.add:
