@@ -75,7 +75,7 @@ def setup() -> AdminResult:
 
     Examples:
         >>> setup()[0]['config']
-        '/home/kpihx/.config/tick-proxy/.env'
+        '~/.config/tick-proxy/.env'
     """
     load_env()
     current = {

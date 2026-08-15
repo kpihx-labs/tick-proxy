@@ -1,5 +1,15 @@
 # Changelog
 
+## 2.2.0 — 2026-08-15
+
+- **Repo relocation:** moved the project root from `proxies/tick_proxy` to `proxies/tick-proxy`
+  (KπX naming convention `xxx-yyy` for the root directory). The Python package stays
+  `src/tick_proxy` and the PyPI/CLI name stays `tick-proxy`.
+- **Config dir aligned:** confirmed every code, doc and README reference points to
+  `~/.config/tick-proxy/` (no underscore variant). Fixed the only hard-coded path left — the
+  `admin setup` docstring example now shows `~/.config/tick-proxy/.env` instead of an absolute
+  `/home/kpihx/...` path.
+
 ## 2.1.0 — 2026-08-12
 
 - Increased the default HITL timeout from 300 to 600 seconds and renamed every HITL page brand to
