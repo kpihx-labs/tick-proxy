@@ -113,7 +113,13 @@ def task_due(task: dict) -> datetime | None:
 
 # TickTick RRULE → weekday map
 _RRULE_DAY_MAP = {
-    "MO": 0, "TU": 1, "WE": 2, "TH": 3, "FR": 4, "SA": 5, "SU": 6,
+    "MO": 0,
+    "TU": 1,
+    "WE": 2,
+    "TH": 3,
+    "FR": 4,
+    "SA": 5,
+    "SU": 6,
 }
 
 
@@ -329,6 +335,7 @@ def resolve_recurrence(
                 valid = target_start.day == day_num
             elif day_num == -1:
                 import calendar
+
                 _, last = calendar.monthrange(target_start.year, target_start.month)
                 valid = target_start.day == last
             else:
@@ -341,9 +348,7 @@ def resolve_recurrence(
             if wd < 0:
                 return None
             nth = int(nth_str) if nth_str else 1
-            resolved = _nth_weekday(
-                target_start.year, target_start.month, wd, nth
-            )
+            resolved = _nth_weekday(target_start.year, target_start.month, wd, nth)
             if not resolved or resolved.date() != target_start.date():
                 return None
         else:
@@ -352,9 +357,8 @@ def resolve_recurrence(
                 return None
 
         # Interval check
-        months_diff = (
-            (target_start.year - anchor.year) * 12
-            + (target_start.month - anchor.month)
+        months_diff = (target_start.year - anchor.year) * 12 + (
+            target_start.month - anchor.month
         )
         if months_diff % interval != 0:
             return None
