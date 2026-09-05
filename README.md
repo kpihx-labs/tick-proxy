@@ -6,7 +6,7 @@ TickTick administrative proxy — RPC CLI for tasks, projects, habits, tags, foc
 > HITL, verification, and transport contracts.
 
 Refonte of [`tick-mcp`](https://github.com/kpihx/tick-mcp) (MCP server, 71 tools) into a non-MCP
-CLI built on the exact model of [`tg-proxy`](https://github.com/KpihX/tg-proxy).
+CLI built on the exact model of [`tg-proxy`](https://github.com/kpihx-labs/tg-proxy).
 
 ---
 

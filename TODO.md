@@ -68,8 +68,8 @@ Summary of what is being asked:
 - [ ] `.gitignore`, `.env.example` (the fully commented block from `CONTRACT.md`), `.gitlab-ci.yml`
       (validate → build → publish, no docker stage)
 - [ ] Package directory tree (`src/tick_proxy/{api,actions,services,admin,templates}/`)
-- [ ] `git init` + remotes `github: git@github.com:KpihX/tick-proxy.git`,
-      `gitlab: git@gitlab.com:kpihx/tick-proxy.git` + repo creation (`gh`, `glab`)
+- [ ] `git init` + remotes `github: git@github.com:kpihx-labs/tick-proxy.git`,
+      `gitlab: git@gitlab.com:kpihx-labs/proxies/tick-proxy.git` + repo creation (`gh`, `glab`)
 
 ### P1 — Core
 - [ ] `config.py` — `.env` loader, documented endpoint defaults, all overridable

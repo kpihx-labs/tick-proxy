@@ -832,7 +832,7 @@ decision (see coverage proof).
 | `git-install-hooks` | pre-commit → `make check` |
 | `release` | `check` → `git-push` → `uv-publish` |
 
-**Remotes:** `github: git@github.com:KpihX/tick-proxy.git` · `gitlab: git@gitlab.com:kpihx/tick-proxy.git`
+**Remotes:** `github: git@github.com:kpihx-labs/tick-proxy.git` · `gitlab: git@gitlab.com:kpihx-labs/proxies/tick-proxy.git`
 
 ---
 
