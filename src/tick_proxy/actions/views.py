@@ -5,7 +5,7 @@ from datetime import UTC, datetime, timedelta
 from pydantic import BaseModel, Field
 
 from ..client import TickClient
-from ..query import day_bounds, filter_tasks, resolve_project_ids
+from ..query import day_bounds, expand_recurring, filter_tasks, resolve_project_ids
 from .base import ActionDef
 
 
@@ -67,6 +67,7 @@ def view_today(client: TickClient, p: ViewPayload) -> dict:
     tasks, f = _scope(client, p)
     f["due_from"], f["due_to"] = start.isoformat(), end.isoformat()
     matched = filter_tasks(tasks, f)
+    matched = expand_recurring(tasks, matched, start, end, f)
     return {"date": start.date().isoformat(), "count": len(matched), "tasks": matched}
 
 
@@ -94,6 +95,7 @@ def view_week(client: TickClient, p: WeekPayload) -> dict:
     tasks, f = _scope(client, p)
     f["due_from"], f["due_to"] = start.isoformat(), end.isoformat()
     matched = filter_tasks(tasks, f)
+    matched = expand_recurring(tasks, matched, start, end, f)
     return {
         "from": start.date().isoformat(),
         "to": end.date().isoformat(),
@@ -123,7 +125,9 @@ def view_week_overview(client: TickClient, p: WeekPayload) -> dict:
 
     window = dict(f, due_from=start.isoformat(), due_to=end.isoformat())
     due = filter_tasks(tasks, window)
+    due = expand_recurring(tasks, due, start, end, f)
     events = filter_tasks(tasks, dict(window, timed_only=True))
+    events = expand_recurring(tasks, events, start, end, dict(f, timed_only=True))
     overdue = filter_tasks(tasks, dict(f, due_to=start.isoformat()))
     return {
         "from": start.date().isoformat(),
@@ -159,6 +163,7 @@ def view_upcoming(client: TickClient, p: UpcomingPayload) -> dict:
     tasks, f = _scope(client, p)
     f["due_from"], f["due_to"] = start.isoformat(), end.isoformat()
     matched = filter_tasks(tasks, f)
+    matched = expand_recurring(tasks, matched, start, end, f)
     return {"days": p.days, "count": len(matched), "tasks": matched}
 
 

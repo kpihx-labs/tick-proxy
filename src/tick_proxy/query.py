@@ -109,6 +109,278 @@ def task_due(task: dict) -> datetime | None:
     return parse_dt(task.get("dueDate")) or parse_dt(task.get("startDate"))
 
 
+# ── recurrence resolution (stdlib only, no dateutil) ──────────────────────────
+
+# TickTick RRULE → weekday map
+_RRULE_DAY_MAP = {
+    "MO": 0, "TU": 1, "WE": 2, "TH": 3, "FR": 4, "SA": 5, "SU": 6,
+}
+
+
+def _parse_rrule_days(flag: str) -> list[int]:
+    """Extract weekday numbers from a TickTick RRULE string.
+
+    Args:
+        flag: e.g. ``"RRULE:FREQ=WEEKLY;INTERVAL=1;BYDAY=FR,TH"``.
+
+    Returns:
+        list[int]: Weekday numbers (0=Mon … 6=Sun). Empty when unparseable.
+
+    Examples:
+        >>> _parse_rrule_days("RRULE:FREQ=WEEKLY;BYDAY=FR")
+        [4]
+        >>> _parse_rrule_days("RRULE:FREQ=WEEKLY;BYDAY=MO,WE,FR")
+        [0, 2, 4]
+    """
+    m = re.search(r"BYDAY=([A-Z,]+)", flag)
+    if not m:
+        return []
+    return [_RRULE_DAY_MAP[d] for d in m.group(1).split(",") if d in _RRULE_DAY_MAP]
+
+
+def _parse_rrule_freq_interval(flag: str) -> tuple[str, int]:
+    """Extract FREQ and INTERVAL from a TickTick RRULE string.
+
+    Args:
+        flag: e.g. ``"RRULE:FREQ=WEEKLY;INTERVAL=2;BYDAY=FR"``.
+
+    Returns:
+        tuple[str, int]: ``(freq, interval)`` — freq is DAILY/WEEKLY/MONTHLY/YEARLY.
+
+    Examples:
+        >>> _parse_rrule_freq_interval("RRULE:FREQ=WEEKLY;INTERVAL=2")
+        ('WEEKLY', 2)
+        >>> _parse_rrule_freq_interval("RRULE:FREQ=DAILY")
+        ('DAILY', 1)
+    """
+    freq_m = re.search(r"FREQ=(DAILY|WEEKLY|MONTHLY|YEARLY)", flag)
+    freq = freq_m.group(1) if freq_m else "WEEKLY"
+    interval_m = re.search(r"INTERVAL=(\d+)", flag)
+    interval = int(interval_m.group(1)) if interval_m else 1
+    return freq, interval
+
+
+def _parse_rrule_until(flag: str) -> datetime | None:
+    """Extract UNTIL from a TickTick RRULE string, if present.
+
+    Args:
+        flag: e.g. ``"RRULE:FREQ=DAILY;UNTIL=20261026"``.
+
+    Returns:
+        datetime | None: The end date, or None for infinite recurrences.
+
+    Examples:
+        >>> _parse_rrule_until("RRULE:FREQ=DAILY;UNTIL=20261026").date().isoformat()
+        '2026-10-26'
+        >>> _parse_rrule_until("RRULE:FREQ=WEEKLY;BYDAY=FR") is None
+        True
+    """
+    m = re.search(r"UNTIL=(\d{8})", flag)
+    if not m:
+        return None
+    return parse_dt(m.group(1))
+
+
+def _is_workday(d: datetime) -> bool:
+    """Whether a date is a weekday (Mon–Fri).
+
+    Examples:
+        >>> _is_workday(datetime(2026, 8, 31, tzinfo=UTC))
+        True
+        >>> _is_workday(datetime(2026, 9, 5, tzinfo=UTC))
+        False
+    """
+    return d.weekday() < 5
+
+
+def _nth_weekday(year: int, month: int, weekday: int, n: int) -> datetime | None:
+    """Return the nth occurrence of weekday in a month (1-indexed; -1 = last).
+
+    Args:
+        year: Year.
+        month: Month (1–12).
+        weekday: Weekday number (0=Mon … 6=Sun).
+        n: 1-indexed occurrence (1=first, 2=second, …, -1=last).
+
+    Returns:
+        datetime | None: The matching date, or None if out of range.
+
+    Examples:
+        >>> _nth_weekday(2026, 9, 4, 1).date().isoformat()
+        '2026-09-04'
+        >>> _nth_weekday(2026, 9, 4, -1).date().isoformat()
+        '2026-09-25'
+    """
+    import calendar
+
+    _, days_in_month = calendar.monthrange(year, month)
+    if n > 0:
+        count = 0
+        for day in range(1, days_in_month + 1):
+            if datetime(year, month, day, tzinfo=UTC).weekday() == weekday:
+                count += 1
+                if count == n:
+                    return datetime(year, month, day, tzinfo=UTC)
+    elif n == -1:
+        for day in range(days_in_month, 0, -1):
+            if datetime(year, month, day, tzinfo=UTC).weekday() == weekday:
+                return datetime(year, month, day, tzinfo=UTC)
+    return None
+
+
+def resolve_recurrence(
+    task: dict, target_start: datetime, target_end: datetime
+) -> datetime | None:
+    """Check whether a recurring task falls within [target_start, target_end].
+
+    Parses the TickTick ``repeatFlag`` and ``dueDate``/``startDate`` to decide
+    if the task would recur on any day in the target window. Returns the
+    resolved occurrence datetime if matched, or None.
+
+    Args:
+        task: A TickTick task dict (must have ``repeatFlag``).
+        target_start: Start of the target window (UTC).
+        target_end: End of the target window (UTC).
+
+    Returns:
+        datetime | None: The resolved occurrence datetime, or None.
+
+    Examples:
+        >>> t = {"repeatFlag": "RRULE:FREQ=WEEKLY;BYDAY=FR",
+        ...       "dueDate": "2026-07-10T19:00:00.000+0000"}
+        >>> resolve_recurrence(t,
+        ...     datetime(2026, 9, 11, 0, 0, tzinfo=UTC),
+        ...     datetime(2026, 9, 11, 23, 59, tzinfo=UTC))
+        datetime.datetime(2026, 9, 11, 19, 0, tzinfo=UTC)
+    """
+    flag = task.get("repeatFlag") or ""
+    if not flag.startswith("RRULE") and not flag.startswith("ERULE"):
+        return None
+
+    # ERULE:NAME=CUSTOM;BYDATE=20260731,20260819
+    if flag.startswith("ERULE"):
+        dates_m = re.search(r"BYDATE=([\d,]+)", flag)
+        if not dates_m:
+            return None
+        for d_str in dates_m.group(1).split(","):
+            dt = parse_dt(d_str)
+            if dt and target_start <= dt <= target_end:
+                return dt
+        return None
+
+    # RRULE resolution
+    anchor = parse_dt(task.get("dueDate")) or parse_dt(task.get("startDate"))
+    if anchor is None:
+        return None
+
+    until = _parse_rrule_until(flag)
+    if until and target_start.date() > until.date():
+        return None
+
+    freq, interval = _parse_rrule_freq_interval(flag)
+    days = _parse_rrule_days(flag)
+
+    # ── FREQ=DAILY ──
+    if freq == "DAILY":
+        if not _is_workday(target_start) and "TT_SKIP=WEEKEND" in flag:
+            return None
+        # Check if target_start is a valid occurrence: (target - anchor) days % interval == 0
+        delta_days = (target_start.date() - anchor.date()).days
+        if delta_days >= 0 and delta_days % interval == 0:
+            # Preserve original time-of-day
+            occ = target_start.replace(
+                hour=anchor.hour, minute=anchor.minute, second=anchor.second
+            )
+            return occ
+        return None
+
+    # ── FREQ=WEEKLY ──
+    if freq == "WEEKLY":
+        if not days:
+            # No BYDAY — repeats on the same weekday as anchor
+            days = [anchor.weekday()]
+        # Check if target day-of-week matches AND the interval is right
+        target_wd = target_start.weekday()
+        if target_wd not in days:
+            return None
+        # Interval check: weeks since anchor must be divisible by interval
+        delta_days = (target_start.date() - anchor.date()).days
+        if delta_days < 0:
+            return None
+        weeks = delta_days // 7
+        if weeks % interval != 0:
+            return None
+        # Preserve original time-of-day
+        occ = target_start.replace(
+            hour=anchor.hour, minute=anchor.minute, second=anchor.second
+        )
+        return occ
+
+    # ── FREQ=MONTHLY ──
+    if freq == "MONTHLY":
+        # BYMONTHDAY=20
+        monthday_m = re.search(r"BYMONTHDAY=(-?\d+)", flag)
+        # BYDAY=5TU (5th Tuesday) or BYDAY=MO
+        byday_m = re.search(r"BYDAY=(-?\d?)(MO|TU|WE|TH|FR|SA|SU)", flag)
+
+        if monthday_m and not byday_m:
+            day_num = int(monthday_m.group(1))
+            if day_num > 0:
+                valid = target_start.day == day_num
+            elif day_num == -1:
+                import calendar
+                _, last = calendar.monthrange(target_start.year, target_start.month)
+                valid = target_start.day == last
+            else:
+                valid = target_start.day == day_num
+            if not valid:
+                return None
+        elif byday_m:
+            nth_str = byday_m.group(1)
+            wd = _RRULE_DAY_MAP.get(byday_m.group(2), -1)
+            if wd < 0:
+                return None
+            nth = int(nth_str) if nth_str else 1
+            resolved = _nth_weekday(
+                target_start.year, target_start.month, wd, nth
+            )
+            if not resolved or resolved.date() != target_start.date():
+                return None
+        else:
+            # Default: same day-of-month as anchor
+            if target_start.day != anchor.day:
+                return None
+
+        # Interval check
+        months_diff = (
+            (target_start.year - anchor.year) * 12
+            + (target_start.month - anchor.month)
+        )
+        if months_diff % interval != 0:
+            return None
+        if months_diff < 0:
+            return None
+
+        occ = target_start.replace(
+            hour=anchor.hour, minute=anchor.minute, second=anchor.second
+        )
+        return occ
+
+    # ── FREQ=YEARLY ──
+    if freq == "YEARLY":
+        if target_start.month != anchor.month or target_start.day != anchor.day:
+            return None
+        years_diff = target_start.year - anchor.year
+        if years_diff < 0 or years_diff % interval != 0:
+            return None
+        occ = target_start.replace(
+            hour=anchor.hour, minute=anchor.minute, second=anchor.second
+        )
+        return occ
+
+    return None
+
+
 def task_tags(task: dict) -> list[str]:
     """Return a task's tags, lower-cased.
 
@@ -378,6 +650,75 @@ def filter_tasks(tasks: list[dict], f: dict[str, Any]) -> list[dict]:
     )
     limit = int(f.get("limit") or 0)
     return out[:limit] if limit > 0 else out
+
+
+def expand_recurring(
+    tasks: list[dict],
+    matched: list[dict],
+    start: datetime,
+    end: datetime,
+    f: dict[str, Any] | None = None,
+) -> list[dict]:
+    """Inject recurring tasks that fall within [start, end] but were missed by filter_tasks.
+
+    TickTick's API never updates ``dueDate`` for future occurrences of recurring
+    tasks — the field keeps the original anchor date.  ``filter_tasks`` therefore
+    excludes them when querying future dates.  This function scans all tasks for
+    ``repeatFlag`` entries and resolves them client-side.
+
+    Args:
+        tasks: The full task list from sync.
+        matched: Already-matched tasks (from ``filter_tasks``).
+        start: Window start (UTC).
+        end: Window end (UTC).
+        f: Optional filter dict (for project/tag/scope constraints).
+
+    Returns:
+        list[dict]: ``matched`` augmented with resolved recurring tasks.
+    """
+    seen_ids = {t.get("id") for t in matched}
+    f = f or {}
+    project_ids = set(f.get("project_ids") or [])
+    tags_wanted = {t.lower() for t in _as_list(f.get("tags"))}
+    tag_mode = f.get("tag_mode", "any")
+    text_query = f.get("text_query")
+    fields = ("title", "content", "desc")
+
+    for t in tasks:
+        tid = t.get("id")
+        if tid in seen_ids:
+            continue
+        flag = t.get("repeatFlag") or ""
+        if not flag:
+            continue
+        # Scope checks
+        if project_ids and t.get("projectId") not in project_ids:
+            continue
+        if tags_wanted:
+            have = set(task_tags(t))
+            if tag_mode == "all" and not tags_wanted.issubset(have):
+                continue
+            if tag_mode != "all" and not (tags_wanted & have):
+                continue
+        if text_query and not text_matches(t, text_query, fields, "any"):
+            continue
+
+        occ = resolve_recurrence(t, start, end)
+        if occ is None:
+            continue
+
+        # Build a synthetic copy with the resolved dueDate
+        synthetic = dict(t)
+        synthetic["dueDate"] = occ.isoformat()
+        synthetic["_recurrence_resolved"] = True
+        matched.append(synthetic)
+        seen_ids.add(tid)
+
+    # Re-sort by dueDate after injection
+    matched.sort(
+        key=lambda t: parse_dt(t.get("dueDate")) or datetime.max.replace(tzinfo=UTC)
+    )
+    return matched
 
 
 def resolve_project_ids(
